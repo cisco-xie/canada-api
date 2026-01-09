@@ -1,0 +1,17 @@
+# 应用服务 WEB 访问端口
+server:
+  port: 8895
+spring:
+  # redis配置
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      timeout: 5s
+      database: 6
+#      password: 20241201
+      password:
+# 为不同业务设置不同的数据库
+redis:
+  database:
+    businessUser: 7
