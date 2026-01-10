@@ -1023,21 +1023,17 @@ public class HandicapApi {
         String baseUrl = userConfig.getBaseUrl();
         String token = userConfig.getToken();
 
-        GameType gameType = GameType.getByLottery(lottery);
-        String url = baseUrl + "member/period?lottery=" + lottery + "&games=" + gameType.getGames() + "&_=" + System.currentTimeMillis();
+        String url = baseUrl + "app/control/LotteryResults.php?searchType=recently10&gtype=9&uid=" + token;
 
         Map<String, String> headers = new HashMap<>();
         headers.put("accept", "*/*");
         headers.put("accept-language", "zh-CN,zh;q=0.9");
-        headers.put("cookie", "defaultSetting=5%2C10%2C20%2C50%2C100%2C200%2C500%2C1000; settingChecked=0; index=; index2=; page=lm; oid=3a9cad1bfcc69f05fd202bb3ddbc9df05b3bc062; defaultLT=" + lottery + "; random=4671; token=" + token + "; __nxquid=QebLfcL6SZckLHDCiGltWK0vmD+qcA==0013;");
         headers.put("priority", "u=1, i");
-        headers.put("sec-ch-ua", "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"");
         headers.put("sec-ch-ua-mobile", "?0");
         headers.put("sec-ch-ua-platform", "\"Windows\"");
         headers.put("sec-fetch-dest", "empty");
         headers.put("sec-fetch-mode", "cors");
         headers.put("sec-fetch-site", "same-origin");
-        headers.put("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
         headers.put("x-requested-with", "XMLHttpRequest");
 
         String result = null;
@@ -1150,7 +1146,7 @@ public class HandicapApi {
      *
      * @return 结果
      */
-    public String odds(String username, String id, String lottery) {
+    public String odds(String username, String id, String wtype) {
         List<UserConfig> userConfigs = configService.accounts(username, id);
         if (CollUtil.isEmpty(userConfigs)) {
             throw new BusinessException(SystemError.USER_1007);
@@ -1160,20 +1156,18 @@ public class HandicapApi {
         String baseUrl = userConfig.getBaseUrl();
         String token = userConfig.getToken();
 
-        GameType gameType = GameType.getByLottery(lottery);
-        String url = baseUrl + "app/control/getRate.php?uid=" + token + "&gtype=9&wtype=" + gameType.getLottery() + "&ltype=1";
+        // GameType gameType = GameType.getByWtype(lottery);
+        String url = baseUrl + "app/control/getRate.php?uid=" + token + "&gtype=9&wtype=" + wtype + "&ltype=1";
 
         Map<String, String> headers = new HashMap<>();
         headers.put("accept", "*/*");
         headers.put("accept-language", "zh-CN,zh;q=0.9");
-        headers.put("cookie", "defaultSetting=5%2C10%2C20%2C50%2C100%2C200%2C500%2C1000; settingChecked=0; index=; index2=; page=lm; defaultLT=" + lottery + "; ssid1=e4ac3642c6b2ea8a51d3a12fc4994ba7; token=" + token);
         headers.put("priority", "u=1, i");
         headers.put("sec-ch-ua-mobile", "?0");
         headers.put("sec-ch-ua-platform", "\"Windows\"");
         headers.put("sec-fetch-dest", "empty");
         headers.put("sec-fetch-mode", "cors");
         headers.put("sec-fetch-site", "same-origin");
-        headers.put("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
         headers.put("x-requested-with", "XMLHttpRequest");
 
         String result;
@@ -1201,7 +1195,7 @@ public class HandicapApi {
             }
         }
 
-        log.info("获取赔率信息, 平台用户:{}, 账号：{}, 游戏:{}, 赔率信息:{}", username, userConfig.getAccount(), lottery, result);
+        log.info("获取赔率信息, 平台用户:{}, 账号：{}, 游戏:{}, 赔率信息:{}", username, userConfig.getAccount(), wtype, result);
         return result;
     }
 
@@ -1605,21 +1599,15 @@ public class HandicapApi {
 
                 JSONObject periodJson = JSONUtil.parseObj(periodMap.get("period"));
                 long closeTime = periodJson.getLong("closeTime");
-                drawNumber.set(periodJson.getStr("drawNumber"));
-
-                // 校验当前期数是否为可下注状态
-                if (1 != periodJson.getInt("status")) {
-                    log.info("平台用户:{},游戏:{},期数:{},当前期数不可下注", username,lottery, drawNumber.get());
-                    return null;
-                }
+                drawNumber.set(periodJson.getStr("gid"));
 
                 // 校验封盘时间
-                if (!validateCloseTime(periodJson, username, lottery, drawNumber.get())) {
+                if (!validateCloseTime(closeTime, username, lottery, drawNumber.get())) {
                     return null;
                 }
 
                 // 获取期数锁
-                RLock lock = acquireBetLock(periodJson, username, lottery, drawNumber.get());
+                RLock lock = acquireBetLock(closeTime, username, lottery, drawNumber.get());
                 if (lock == null) {
                     log.info("平台用户:{},游戏:{},期数:{},方案:{},当前期数正在执行", username, lottery, drawNumber.get(), "合并型方案");
                     return null;
@@ -2094,7 +2082,7 @@ public class HandicapApi {
             completionService.submit(() -> {
                 Map<String, String> res = new HashMap<>();
                 try {
-                    String period = period(username, config.getId(), lottery);
+                    String period = odds(username, config.getId(), lottery);
                     if (StringUtils.isBlank(period)) {
                         log.info("平台用户:{}, 方案:{}, 游戏:{}, 账号:{} 获取期数为空", username, planName, lottery, config.getAccount());
                         res.put("account", config.getAccount());
@@ -2247,18 +2235,15 @@ public class HandicapApi {
 
     /**
      * 校验封盘时间
-     * @param periodJson
+     * @param closeTime
      * @param username
      * @param lottery
      * @param drawNumber
      * @return
      */
-    private boolean validateCloseTime(JSONObject periodJson, String username, String lottery, String drawNumber) {
-        long closeTime = periodJson.getLong("closeTime") / 1000;
-        long currentTime = System.currentTimeMillis() / 1000;
-        long betTime = closeTime - currentTime;
-        if (betTime < 15) {
-            log.info("平台用户:{}, 游戏:{}, 期数:{}, 剩余封盘时间:{}, 即将封盘, 不进行下注", username, lottery, drawNumber, betTime);
+    private boolean validateCloseTime(long closeTime, String username, String lottery, String drawNumber) {
+        if (closeTime < 15) {
+            log.info("平台用户:{}, 游戏:{}, 期数:{}, 剩余封盘时间:{}, 即将封盘, 不进行下注", username, lottery, drawNumber, closeTime);
             return false;
         }
         return true;
@@ -2268,17 +2253,13 @@ public class HandicapApi {
      * 尝试获取期数锁
      * @param username
      * @param drawNumber
-     * @param periodJson     期数信息（获取封盘时间用于锁的持续时间）
      * @return
      */
-    private RLock acquireBetLock(JSONObject periodJson, String username, String lottery, String drawNumber) {
-        long closeTime = periodJson.getLong("closeTime") / 1000;
-        long currentTime = System.currentTimeMillis() / 1000;
-        long betTime = closeTime - currentTime;
+    private RLock acquireBetLock(long closeTime, String username, String lottery, String drawNumber) {
         RLock lock = businessUserRedissonClient.getLock(KeyUtil.genKey(RedisConstants.USER_BET_PERIOD_PREFIX, lottery, drawNumber, username, "merge"));
         try {
             // 5秒内尝试获取锁，持锁时间到封盘时间+10秒
-            if (lock.tryLock(5, betTime + 10, TimeUnit.SECONDS)) {
+            if (lock.tryLock(5, closeTime + 10, TimeUnit.SECONDS)) {
                 return lock;
             }
         } catch (InterruptedException e) {
@@ -2296,7 +2277,7 @@ public class HandicapApi {
 
         // 创建异常数据的 JSON 对象
         JSONObject jsonObject = new JSONObject();
-        jsonObject.putOpt("lottery", Objects.requireNonNull(GameType.getByLottery(lottery)).getDescription());
+        jsonObject.putOpt("lottery", Objects.requireNonNull(GameType.getByWtype(lottery)).getDescription());
         jsonObject.putOpt("datetime", LocalDateTimeUtil.formatNormal(LocalDateTime.now()));
         jsonObject.putOpt("title", "自动投注");
         jsonObject.putOpt("description", "检测到账号["+account+"]状态异常或盘口网络异常，请检查账号以及网络状态。跳过当前期数，下期开始自动投注。");

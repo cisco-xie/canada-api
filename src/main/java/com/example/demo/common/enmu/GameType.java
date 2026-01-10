@@ -19,7 +19,7 @@ public enum GameType {
     DW3("DW3", "", "三字定位"),
     N5("n5", "", "两面盘");
 
-    private final String lottery;
+    private final String wtype;
     private final String games;
     private final String description;
 
@@ -30,7 +30,7 @@ public enum GameType {
     // 静态代码块用于初始化映射
     static {
         for (GameType type : values()) {
-            LOTTERY_MAP.put(type.getLottery(), type);
+            LOTTERY_MAP.put(type.getWtype(), type);
             DESCRIPTION_MAP.put(type.getDescription(), type.getGames());
         }
     }
@@ -40,9 +40,9 @@ public enum GameType {
         return new HashMap<>(DESCRIPTION_MAP); // 返回副本，避免外部修改
     }
 
-    // 根据lottery获取枚举实例
-    public static GameType getByLottery(String lottery) {
-        return LOTTERY_MAP.get(lottery); // 快速查找
+    // 根据wtype获取枚举实例
+    public static GameType getByWtype(String wtype) {
+        return LOTTERY_MAP.get(wtype); // 快速查找
     }
 }
 

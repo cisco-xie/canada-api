@@ -362,24 +362,17 @@ public class PlanDoubleService {
 
                         JSONObject periodJson = JSONUtil.parseObj(periodMap.get("period"));
                         if (StringUtils.isNotBlank(periodMap.get("period")) && drawNumber.get() == null) {
-                            drawNumber.compareAndSet(null, periodJson.getStr("drawNumber"));
+                            drawNumber.compareAndSet(null, periodJson.getStr("gid"));
                             drawTime.compareAndSet(null, periodJson.getLong("drawTime"));
                             closeTime.compareAndSet(null, periodJson.getLong("closeTime"));
                         }
-
-                        // 校验当前期数是否为可下注状态
-                        if (1 != periodJson.getInt("status")) {
-                            log.info("翻倍计划-平台用户:{},游戏:{},期数:{},当前期数不可下注", username, plan.getLottery(), drawNumber.get());
-                            return;
-                        }
-
                         // 校验封盘时间
-                        if (!validateCloseTime(periodJson, username, plan.getLottery(), drawNumber.get())) {
+                        if (!validateCloseTime(closeTime.get(), username, plan.getLottery(), drawNumber.get())) {
                             return;
                         }
 
                         // 获取期数锁
-                        RLock lock = acquireBetLock(periodJson, username, plan, drawNumber.get());
+                        RLock lock = acquireBetLock(closeTime.get(), username, plan, drawNumber.get());
                         if (lock == null) {
                             log.info("翻倍计划-平台用户:{},游戏:{},期数:{},方案:{},当前期数正在执行", username, plan.getLottery(), drawNumber.get(), plan.getName());
                             return;
@@ -464,6 +457,8 @@ public class PlanDoubleService {
                         }
                         JSONObject oddsJson = JSONUtil.parseObj(odds);
 
+                        // 投注位置
+                        List<BetNew> order = new ArrayList<>();
                         // 获取正反投的位置 key
                         Map<Integer, Map<String, List<String>>> oddsMap = new HashMap<>();
                         // 获取号码
@@ -487,22 +482,16 @@ public class PlanDoubleService {
                                     if (!hasChinese) {
                                         // 没有中文的一概以号码处理
                                         List<Integer> ids = formatIds(pos.getPositionNum());
-//                                        List<Integer> idsNew = new ArrayList<>();
-//                                        if (plan.getReverseType() == 1) { // 竖式
-//                                            idsNew = ids;
-//                                        } else if (plan.getReverseType() == 2) {    // 横式
-//                                            // 获取除了ids的其他位置
-//                                            idsNew = IntStream.rangeClosed(1, 10) // 生成 1 到 10 的整数
-//                                                    .boxed() // 转换为 List<Integer>
-//                                                    .filter(id -> !ids.contains(id)) // 过滤掉 `ids` 中已有的值
-//                                                    .toList();
-//                                        }
                                         for (Integer id : ids) {
-                                            String jsonKey = "B" + id;
+                                            // 获取和值位置赔率，和值位置需要加1
+                                            String rate = oddsJson.getJSONArray("rate").getStr(id + 1);
+                                            BetNew betNew = new BetNew();
+                                            // 投注时下标需要减1
+                                            String idIndex = String.valueOf(id - 1);
                                             List<String> matchedKeys = oddsJson.keySet().stream()
-                                                    .filter(matchedKey -> matchedKey.contains(jsonKey + "_"))
+                                                    .filter(matchedKey -> matchedKey.contains(idIndex))
                                                     .collect(Collectors.toList());
-                                            Map<String, List<String>> oddKeys = getOdds(plan.getReverseType(), matchedKeys, pos.getLocationNum());
+                                            Map<String, List<String>> oddKeys = getOdds(plan.getReverseType(), matchedKeys, pos.getPositionNum());
                                             oddsMap.put(id, oddKeys);
                                             amountKeys.add(id);
                                         }
@@ -1615,18 +1604,15 @@ public class PlanDoubleService {
 
     /**
      * 校验封盘时间
-     * @param periodJson
+     * @param closeTime
      * @param username
      * @param lottery
      * @param drawNumber
      * @return
      */
-    private boolean validateCloseTime(JSONObject periodJson, String username, String lottery, String drawNumber) {
-        long closeTime = periodJson.getLong("closeTime") / 1000;
-        long currentTime = System.currentTimeMillis() / 1000;
-        long betTime = closeTime - currentTime;
-        if (betTime < 15) {
-            log.info("翻倍计划-平台用户:{}, 游戏:{}, 期数:{}, 剩余封盘时间:{}, 即将封盘, 不进行下注", username, lottery, drawNumber, betTime);
+    private boolean validateCloseTime(long closeTime, String username, String lottery, String drawNumber) {
+        if (closeTime < 15) {
+            log.info("翻倍计划-平台用户:{}, 游戏:{}, 期数:{}, 剩余封盘时间:{}, 即将封盘, 不进行下注", username, lottery, drawNumber, closeTime);
             return false;
         }
         return true;
@@ -1639,14 +1625,11 @@ public class PlanDoubleService {
      * @param drawNumber
      * @return
      */
-    private RLock acquireBetLock(JSONObject periodJson, String username, PlanDoubleVO plan, String drawNumber) {
-        long closeTime = periodJson.getLong("closeTime") / 1000;
-        long currentTime = System.currentTimeMillis() / 1000;
-        long betTime = closeTime - currentTime;
+    private RLock acquireBetLock(long closeTime, String username, PlanDoubleVO plan, String drawNumber) {
         RLock lock = businessUserRedissonClient.getLock(KeyUtil.genKey(RedisConstants.USER_BET_DOUBLE_PERIOD_PREFIX, plan.getLottery(), drawNumber, username, String.valueOf(plan.getId())));
         try {
             // 5秒内尝试获取锁，持锁时间到封盘时间+10秒
-            if (lock.tryLock(5, betTime + 10, TimeUnit.SECONDS)) {
+            if (lock.tryLock(5, closeTime + 10, TimeUnit.SECONDS)) {
                 return lock;
             }
         } catch (InterruptedException e) {
