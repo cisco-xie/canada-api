@@ -1195,6 +1195,10 @@ public class HandicapApi {
             }
         }
 
+        JSONObject jsonObject = JSONUtil.parseObj(result);
+        if (jsonObject.getInt("title") != 1) {
+            throw new BusinessException(SystemError.USER_1015);
+        }
         log.info("获取赔率信息, 平台用户:{}, 账号：{}, 游戏:{}, 赔率信息:{}", username, userConfig.getAccount(), wtype, result);
         return result;
     }
@@ -1251,7 +1255,7 @@ public class HandicapApi {
     }
 
     /**
-     * 下单api
+     * 加拿大28 下单api
      *
      * @return 结果
      */
@@ -4309,6 +4313,15 @@ public class HandicapApi {
         };
     }
 
+    /**
+     * 获取今日未结/已结明细（新API）
+     * @param username 用户名
+     * @param id 账号ID
+     * @param settled true=已结明细，false=未结明细
+     * @param pageNo 页码（从0开始）
+     * @param isSummary 是否汇总
+     * @return JSON字符串
+     */
     public String settled(String username, String id, Boolean settled, Integer pageNo, Boolean isSummary) {
         // 获取用户配置
         List<UserConfig> userConfigs = configService.accounts(username, id);
@@ -4318,26 +4331,57 @@ public class HandicapApi {
         UserConfig userConfig = userConfigs.get(0);
         String baseUrl = userConfig.getBaseUrl();
         String token = userConfig.getToken();
+        
         if (pageNo == null) {
-            pageNo = 1;
+            pageNo = 0; // 新API页码从0开始
+        } else {
+            // 前端传递的页码通常从1开始，需要转换为从0开始
+            pageNo = pageNo - 1;
+            if (pageNo < 0) {
+                pageNo = 0;
+            }
         }
-        String url = baseUrl + "member/bets?page=" + pageNo;
+        
+        // 构建新API URL
+        String url;
+        Map<String, String> headers = new HashMap<>();
+        
         if (Boolean.TRUE.equals(settled)) {
-            url += "&settled=true";
+            // 今日已结明细：app/control/Report.php?uid=xxx&dts=2026-01-15&dte=2026-01-15&active=1&gtype=0&pages=0
+            String today = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
+            url = baseUrl + "app/control/Report.php?uid=" + token + "&dts=" + today + "&dte=" + today + "&active=1&gtype=0&pages=" + pageNo;
+        } else {
+            // 今日未结明细：app/control/betDetail.php?uid=xxx&active=list&gametype=9&pages=0
+            url = baseUrl + "app/control/betDetail.php?uid=" + token + "&active=list&gametype=9&pages=" + pageNo;
         }
 
         // 设置请求头
-        Map<String, String> headers = new HashMap<>();
-        headers.put("accept", "*/*");
+        headers.put("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7");
         headers.put("accept-language", "zh-CN,zh;q=0.9");
-        headers.put("cookie", "defaultSetting=5%2C10%2C20%2C50%2C100%2C200%2C500%2C1000; settingChecked=0; page=lm; index=; index2=; token=" + token);
-        headers.put("priority", "u=1, i");
-        headers.put("x-requested-with", "XMLHttpRequest");
+        headers.put("cache-control", "no-cache");
+        headers.put("pragma", "no-cache");
+        headers.put("priority", "u=0, i");
+        headers.put("referer", baseUrl + "app/control/" + (Boolean.TRUE.equals(settled) ? "Report.php" : "betDetail.php") + "?uid=" + token);
+        headers.put("sec-ch-ua", "\"Google Chrome\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"");
+        headers.put("sec-ch-ua-mobile", "?0");
+        headers.put("sec-ch-ua-platform", "\"Windows\"");
+        headers.put("sec-fetch-dest", "iframe");
+        headers.put("sec-fetch-mode", "navigate");
+        headers.put("sec-fetch-site", "same-origin");
+        headers.put("sec-fetch-user", "?1");
+        headers.put("upgrade-insecure-requests", "1");
+        headers.put("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36");
+        
+        // 设置Cookie（新API需要的Cookie格式）
+        // 注意：PHPSESSID应该从登录响应中获取，这里暂时使用token
+        // 如果登录时返回了PHPSESSID，应该存储在userConfig中
+        String cookie = "gtype=9; nowpage=game.html; PHPSESSID=" + token;
+        headers.put("cookie", cookie);
 
         String result;
         long delayMs;
         try {
-            // 用okHttp代理调度器发起GET请求，body传空字符串
+            // 用okHttp代理调度器发起GET请求
             OkHttpProxyDispatcher.HttpResult resultHttp = dispatcher.execute("GET", url, null, headers, userConfig, false);
             result = StringUtils.isNotBlank(resultHttp.getBody()) ? resultHttp.getBody() : null;
             delayMs = resultHttp.getDurationMs();
@@ -4361,80 +4405,282 @@ public class HandicapApi {
             }
         }
 
-        // 解析 HTML 数据
-        Document doc = Jsoup.parse(result);
+        // 解析HTML中的JavaScript变量dataArr
         JSONObject resultJson = new JSONObject();
         JSONArray tableData = new JSONArray();
         resultJson.putOpt("delayMs", delayMs);
 
-        Elements rows = doc.select("table.list tbody tr");
-        for (Element row : rows) {
-            Elements cols = row.select("td");
-            if (cols.size() > 0) {
-                if (cols.first().hasClass("nodata") && cols.first().text().contains("暂无数据")) {
-                    log.info("暂无数据，无需解析");
-                    break;
+        try {
+            // 从HTML中提取JavaScript变量dataArr
+            // 匹配格式：var dataArr = [{...}]; 或 var dataArr = [];
+            Pattern dataArrPattern = Pattern.compile("var\\s+dataArr\\s*=\\s*(\\[.*?\\]);", Pattern.DOTALL);
+            Matcher dataArrMatcher = dataArrPattern.matcher(result);
+            
+            if (dataArrMatcher.find()) {
+                String dataArrStr = dataArrMatcher.group(1);
+                // 处理空数组
+                if (dataArrStr.trim().equals("[]")) {
+                    log.info("新API返回空数组，无注单数据");
+                } else {
+                    // 解析JSON数组
+                    JSONArray dataArr = JSONUtil.parseArray(dataArrStr);
+                    
+                    // 解析每个注单数据
+                    for (Object obj : dataArr) {
+                        JSONObject dx = JSONUtil.parseObj(obj);
+                        JSONObject rowData = new JSONObject();
+                        
+                        // 账号
+                        rowData.putOpt("account", userConfig.getAccount());
+                        // 注单号
+                        rowData.putOpt("orderNo", dx.getStr("id"));
+                        // 时间
+                        rowData.putOpt("time", dx.getStr("adddate"));
+                        // 游戏类型
+                        rowData.putOpt("type", dx.getStr("gname"));
+                        // 期号
+                        rowData.putOpt("drawNumber", dx.getStr("round"));
+                        // 下注类型
+                        rowData.putOpt("play", dx.getStr("wname"));
+                        // 盘口（ltype: 1=A, 2=B, 3=C, ...）
+                        String ltypeStr = getLtypeString(dx.getInt("ltype", 1));
+                        rowData.putOpt("range", ltypeStr + "盘");
+                        // 注单明细
+                        rowData.putOpt("detail", dx.getStr("text") + "@" + dx.getStr("rate"));
+                        // 下注金额
+                        rowData.putOpt("amount", dx.getStr("amount"));
+                        // 退水(%)
+                        if (Boolean.TRUE.equals(settled)) {
+                            rowData.putOpt("rebate", dx.getStr("wgold")); // 已结明细使用wgold
+                        } else {
+                            rowData.putOpt("rebate", dx.getStr("back")); // 未结明细使用back
+                        }
+                        // 状态/结果
+                        if (Boolean.TRUE.equals(settled)) {
+                            // 已结明细：rame=2已取消，rame=5和局，其他显示退水后结果
+                            int rame = dx.getInt("rame", 0);
+                            if (rame == 2) {
+                                rowData.putOpt("result", "已取消");
+                            } else if (rame == 5) {
+                                rowData.putOpt("result", "和局");
+                            } else {
+                                // 退水后结果 = wingold + wgold
+                                BigDecimal wingold = dx.getBigDecimal("wingold", BigDecimal.ZERO);
+                                BigDecimal wgold = dx.getBigDecimal("wgold", BigDecimal.ZERO);
+                                BigDecimal resultAmount = wingold.add(wgold);
+                                rowData.putOpt("result", resultAmount.toString());
+                            }
+                        } else {
+                            // 未结明细：rame=0有效，rame=2已取消
+                            int rame = dx.getInt("rame", 0);
+                            if (rame == 2) {
+                                rowData.putOpt("result", "已取消");
+                            } else {
+                                rowData.putOpt("result", "有效");
+                            }
+                        }
+                        
+                        // 额外字段（用于前端显示）
+                        rowData.putOpt("playtype", dx.getStr("playtype"));
+                        rowData.putOpt("wtype", dx.getStr("wtype"));
+                        rowData.putOpt("rate", dx.getStr("rate"));
+                        rowData.putOpt("wingold", dx.getStr("wingold"));
+                        rowData.putOpt("mutinum", dx.getStr("mutinum"));
+                        
+                        tableData.add(rowData);
+                    }
                 }
-                JSONObject rowData = new JSONObject();
-                rowData.putOpt("account", userConfig.getAccount() + "(" + (userConfig.getBetType() == 1 ? "正" : "反") + ")");    // 账号
-                rowData.putOpt("orderNo", cols.get(0).text());  // 注单号
-                rowData.putOpt("time", cols.get(1).text());     // 时间
-                rowData.putOpt("type", cols.get(2).select(".lottery").text());              // 类型
-                rowData.putOpt("drawNumber", cols.get(2).select(".draw_number").text());    // 期号
-                rowData.putOpt("play", cols.get(3).text());     // 玩法
-                rowData.putOpt("range", cols.get(4).text());    // 盘口
-                rowData.putOpt("amount", cols.get(5).text());   // 下注金额
-                rowData.putOpt("rebate", cols.get(6).text());   // 退水(%)
-                rowData.putOpt("result", cols.get(7).text());   // 结果
-                tableData.add(rowData);
+            } else {
+                log.warn("新API返回的HTML中未找到dataArr变量");
             }
-        }
-
-        if (Boolean.TRUE.equals(isSummary)) {
-            // 解析总计表格内容
-            Elements rowsTotal = doc.select("table.list tfoot tr");
-            for (Element row : rowsTotal) {
-                Elements cols = row.select("td");
-                if (cols.size() > 0) {
-                    JSONObject rowData = new JSONObject();
-                    rowData.putOpt("account", userConfig.getAccount()); // 账号
-                    rowData.putOpt("totalAmount", cols.get(4).text());  // 总流水
-                    rowData.putOpt("totalResult", cols.get(6).text());  // 总盈亏
-                    tableData.add(rowData);
+            
+            // 解析分页信息
+            Pattern amountPagePattern = Pattern.compile("var\\s+amount_page\\s*=\\s*(\\d+)");
+            Pattern nowPagePattern = Pattern.compile("var\\s+nowPage\\s*=\\s*(\\d+)\\s*\\+\\s*1");
+            Pattern totalPattern = Pattern.compile("共\\s+(\\d+)\\s+条记录");
+            
+            Matcher amountPageMatcher = amountPagePattern.matcher(result);
+            Matcher nowPageMatcher = nowPagePattern.matcher(result);
+            Matcher totalMatcher = totalPattern.matcher(result);
+            
+            int totalPages = 1;
+            int currentPage = pageNo + 1;
+            int total = 0;
+            
+            if (amountPageMatcher.find()) {
+                totalPages = Integer.parseInt(amountPageMatcher.group(1));
+            }
+            if (nowPageMatcher.find()) {
+                currentPage = Integer.parseInt(nowPageMatcher.group(1));
+            }
+            if (totalMatcher.find()) {
+                total = Integer.parseInt(totalMatcher.group(1));
+            }
+            
+            resultJson.putOpt("list", tableData);
+            resultJson.putOpt("total", total);
+            resultJson.putOpt("pageSize", 15); // 默认每页15条
+            resultJson.putOpt("currentPage", currentPage);
+            resultJson.putOpt("totalPages", totalPages);
+            
+            // 如果是汇总模式，计算总计
+            if (Boolean.TRUE.equals(isSummary)) {
+                BigDecimal totalAmount = BigDecimal.ZERO;
+                BigDecimal totalResult = BigDecimal.ZERO;
+                
+                for (Object obj : tableData) {
+                    JSONObject row = JSONUtil.parseObj(obj);
+                    String amountStr = row.getStr("amount");
+                    if (StringUtils.isNotBlank(amountStr)) {
+                        try {
+                            totalAmount = totalAmount.add(new BigDecimal(amountStr));
+                        } catch (Exception e) {
+                            log.warn("解析金额失败: {}", amountStr);
+                        }
+                    }
+                    
+                    if (Boolean.TRUE.equals(settled)) {
+                        String resultStr = row.getStr("result");
+                        if (StringUtils.isNotBlank(resultStr) && !resultStr.equals("已取消") && !resultStr.equals("和局")) {
+                            try {
+                                totalResult = totalResult.add(new BigDecimal(resultStr));
+                            } catch (Exception e) {
+                                log.warn("解析结果金额失败: {}", resultStr);
+                            }
+                        }
+                    }
                 }
+                
+                JSONObject summaryData = new JSONObject();
+                summaryData.putOpt("account", userConfig.getAccount());
+                summaryData.putOpt("totalAmount", totalAmount.toString());
+                summaryData.putOpt("totalResult", totalResult.toString());
+                tableData.add(summaryData);
             }
-        }
-        resultJson.putOpt("list", tableData);
-        // 分页数据解析
-        Elements pagination = doc.select(".page_info");
-        if (!pagination.isEmpty()) {
-            JSONObject paginationJson = new JSONObject();
-            Element pageInfo = pagination.first();
-            Elements pageLinks = pageInfo.select("a");
-            for (Element link : pageLinks) {
-                if (link.hasClass("active")) {
-                    paginationJson.putOpt("currentPage", link.text());
-                } else if (link.text().contains("下一页")) {
-                    paginationJson.putOpt("nextPage", link.attr("href"));
-                } else if (link.text().contains("上一页")) {
-                    paginationJson.putOpt("previousPage", link.attr("href"));
-                }
-            }
-            // 总页数和总数据量可以根据分页元素中是否包含这些信息解析
-            Element totalElement = pageInfo.selectFirst(".page_info");
-            if (totalElement != null) {
-                String totalText = totalElement.text();
-                // 解析总页数和总数据量（假设文本格式为 "共 x 页/ y 条数据"）
-                Pattern pattern = Pattern.compile("共 (\\d+) 笔记录 共 (\\d+) 页");
-                Matcher matcher = pattern.matcher(totalText);
-                if (matcher.find()) {
-                    resultJson.putOpt("total", Integer.valueOf(matcher.group(1)));
-                    resultJson.putOpt("pageSize", 15);
-                }
-            }
+            
+        } catch (Exception e) {
+            log.error("解析新API返回数据失败: {}", e.getMessage(), e);
+            resultJson.putOpt("list", new JSONArray());
+            resultJson.putOpt("total", 0);
+            resultJson.putOpt("pageSize", 15);
+            resultJson.putOpt("currentPage", pageNo + 1);
+            resultJson.putOpt("totalPages", 1);
         }
 
         return resultJson.toString();
+    }
+    
+    /**
+     * 获取盘口字符串（ltype转换为A/B/C等）
+     */
+    private String getLtypeString(int ltype) {
+        return switch (ltype) {
+            case 1 -> "A";
+            case 2 -> "B";
+            case 3 -> "C";
+            case 4 -> "D";
+            case 5 -> "E";
+            case 6 -> "F";
+            case 7 -> "G";
+            case 8 -> "H";
+            default -> "A";
+        };
+    }
+    
+    /**
+     * 获取注单详细赔率（新API）
+     * @param username 用户名
+     * @param id 账号ID
+     * @param betID 注单ID
+     * @param gametype 游戏类型
+     * @param orderdt 订单日期（格式：yyyy-MM-dd）
+     * @param wtype 投注类型（如MSA0）
+     * @return JSON字符串
+     */
+    public String betDetail(String username, String id, String betID, String gametype, String orderdt, String wtype) {
+        // 获取用户配置
+        List<UserConfig> userConfigs = configService.accounts(username, id);
+        if (CollectionUtil.isEmpty(userConfigs)) {
+            throw new BusinessException(SystemError.USER_1007);
+        }
+        UserConfig userConfig = userConfigs.get(0);
+        String baseUrl = userConfig.getBaseUrl();
+        String token = userConfig.getToken();
+        
+        // 构建新API URL
+        // betDetail.php?showBetDetail=showBetDetail&uid=xxx&betID=xxx&gametype=xxx&orderdt=xxx
+        String url = baseUrl + "app/control/betDetail.php?showBetDetail=showBetDetail&uid=" + token 
+                + "&betID=" + betID + "&gametype=" + gametype + "&orderdt=" + orderdt;
+        
+        // 设置请求头
+        Map<String, String> headers = new HashMap<>();
+        headers.put("accept", "application/json, text/javascript, */*; q=0.01");
+        headers.put("accept-language", "zh-CN,zh;q=0.9");
+        headers.put("cache-control", "no-cache");
+        headers.put("pragma", "no-cache");
+        headers.put("priority", "u=1, i");
+        headers.put("referer", baseUrl + "app/control/betDetail.php?uid=" + token);
+        headers.put("sec-ch-ua", "\"Google Chrome\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"");
+        headers.put("sec-ch-ua-mobile", "?0");
+        headers.put("sec-ch-ua-platform", "\"Windows\"");
+        headers.put("sec-fetch-dest", "empty");
+        headers.put("sec-fetch-mode", "cors");
+        headers.put("sec-fetch-site", "same-origin");
+        headers.put("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36");
+        headers.put("x-requested-with", "XMLHttpRequest");
+        
+        // 设置Cookie
+        String cookie = "gtype=9; nowpage=game.html; PHPSESSID=" + token;
+        headers.put("cookie", cookie);
+        
+        String result;
+        try {
+            // 用okHttp代理调度器发起GET请求
+            OkHttpProxyDispatcher.HttpResult resultHttp = dispatcher.execute("GET", url, null, headers, userConfig, false);
+            result = StringUtils.isNotBlank(resultHttp.getBody()) ? resultHttp.getBody() : null;
+        } catch (Exception e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof UnknownHostException) {
+                log.error("获取详细赔率失败：主机未知。异常信息：{}", e.getMessage(), e);
+                throw new BusinessException(SystemError.SYS_419, userConfig.getAccount(), "代理请求失败");
+            } else if (cause instanceof ConnectException) {
+                log.error("获取详细赔率失败：连接异常。异常信息：{}", e.getMessage(), e);
+                throw new BusinessException(SystemError.SYS_419, userConfig.getAccount(), "连接异常");
+            } else if (cause instanceof SocketTimeoutException) {
+                log.error("获取详细赔率失败：连接超时。异常信息：{}", e.getMessage(), e);
+                throw new BusinessException(SystemError.SYS_419, userConfig.getAccount(), "连接超时");
+            } else if (cause instanceof IOException) {
+                log.error("获取详细赔率失败：IO异常。异常信息：{}", e.getMessage(), e);
+                throw new BusinessException(SystemError.SYS_419, userConfig.getAccount(), "IO异常");
+            } else {
+                log.error("获取详细赔率失败：未知异常。异常信息：{}", e.getMessage(), e);
+                throw new BusinessException(SystemError.SYS_419, userConfig.getAccount(), "未知异常");
+            }
+        }
+        
+        // 解析JSON响应
+        if (StringUtils.isBlank(result)) {
+            log.warn("获取详细赔率返回为空, betID:{}, gametype:{}", betID, gametype);
+            JSONObject errorResult = new JSONObject();
+            errorResult.putOpt("title", 0);
+            errorResult.putOpt("message", "返回数据为空");
+            return errorResult.toString();
+        }
+        
+        try {
+            JSONObject resultJson = JSONUtil.parseObj(result);
+            // 验证响应格式
+            if (resultJson.getInt("title", -1) != 1) {
+                log.warn("获取详细赔率失败, betID:{}, gametype:{}, 响应:{}", betID, gametype, result);
+            }
+            return resultJson.toString();
+        } catch (Exception e) {
+            log.error("解析详细赔率响应失败: {}", e.getMessage(), e);
+            JSONObject errorResult = new JSONObject();
+            errorResult.putOpt("title", 0);
+            errorResult.putOpt("message", "解析响应失败: " + e.getMessage());
+            return errorResult.toString();
+        }
     }
 
 
@@ -4521,98 +4767,85 @@ public class HandicapApi {
         return resultJson.toString();
     }
 
+    private static final Pattern RETURN_DATA_PATTERN =
+            Pattern.compile("var\\s+returnData\\s*=\\s*(\\[.*?\\]);", Pattern.DOTALL);
+
     /**
      * 获取开奖信息列表-获取最近50条
      * @param username
      * @param id
-     * @param lottery
      * @return
      */
-    public JSONArray dresults(String username, String id, String lottery) {
-        // 获取用户配置
+    public JSONArray dresults(String username, String id, String date, int page) {
         List<UserConfig> userConfigs = configService.accounts(username, id);
         if (CollectionUtil.isEmpty(userConfigs)) {
             throw new BusinessException(SystemError.USER_1007);
         }
+
+        if (StringUtils.isBlank(date)) {
+            date = LocalDateTimeUtil.now().format(DateTimeFormatter.ofPattern(DatePattern.NORM_DATE_PATTERN));
+        }
         UserConfig userConfig = userConfigs.get(0);
-        String baseUrl = userConfig.getBaseUrl();
-        String token = userConfig.getToken();
 
-        // 拼接请求 URL
-        String url = baseUrl + "member/dresult?lottery=" + lottery;
+        String url = userConfig.getBaseUrl()
+                + "app/control/lottoHistory.php"
+                + "?uid=" + userConfig.getToken()
+                + "&active=1"
+                + "&gtype=9"
+                + "&pages=" + page
+                + "&dts=" + date;
 
-        // 设置请求头
         Map<String, String> headers = new HashMap<>();
-        headers.put("accept", "*/*");
-        headers.put("accept-language", "zh-CN,zh;q=0.9");
-        headers.put("cookie", "defaultSetting=5%2C10%2C20%2C50%2C100%2C200%2C500%2C1000; settingChecked=0; page=lm; index=; index2=; token=" + token);
-        headers.put("priority", "u=1, i");
-        headers.put("x-requested-with", "XMLHttpRequest");
+        headers.put("accept", "text/html,application/xhtml+xml,*/*");
+        headers.put("referer", url);
 
-        // 发送 HTTP 请求
-        String result = null;
+        String html;
         try {
-            // 执行请求
-            OkHttpProxyDispatcher.HttpResult resultHttp = dispatcher.execute("GET", url, null, headers, userConfig, false);
-            result = StringUtils.isNotBlank(resultHttp.getBody()) ? resultHttp.getBody() : null;
+            OkHttpProxyDispatcher.HttpResult result =
+                    dispatcher.execute("GET", url, null, headers, userConfig, false);
+
+            html = result.getBody();
+            if (StringUtils.isBlank(html)) {
+                return new JSONArray();
+            }
 
         } catch (Exception e) {
-            Throwable cause = e.getCause(); // 获取原始异常原因
-            if (cause instanceof UnknownHostException) {
-                log.error("代理请求失败：主机未知。可能是域名解析失败或代理地址有误。异常信息：{}", e.getMessage(), e);
-                throw new BusinessException(SystemError.SYS_419, userConfigs.get(0).getAccount(), "代理请求失败");
-            } else if (cause instanceof ConnectException) {
-                log.error("代理请求失败：连接异常。可能是代理服务器未开启或网络不可达。异常信息：{}", e.getMessage(), e);
-                throw new BusinessException(SystemError.SYS_419, userConfigs.get(0).getAccount(), "连接异常");
-            } else if (cause instanceof SocketTimeoutException) {
-                log.error("代理请求失败：连接超时。可能是网络延迟过高或代理服务器响应缓慢。异常信息：{}", e.getMessage(), e);
-                throw new BusinessException(SystemError.SYS_419, userConfigs.get(0).getAccount(), "连接超时");
-            } else if (cause instanceof IOException) {
-                log.error("代理请求失败：IO异常。可能是数据传输错误或代理配置不正确。异常信息：{}", e.getMessage(), e);
-                throw new BusinessException(SystemError.SYS_419, userConfigs.get(0).getAccount(), "IO异常");
-            } else {
-                log.error("代理请求失败：未知异常。异常信息：{}", e.getMessage(), e);
-                throw new BusinessException(SystemError.SYS_419, userConfigs.get(0).getAccount(), "未知异常");
-            }
+            log.error("获取历史开奖失败 lottoHistory", e);
+            throw new BusinessException(SystemError.SYS_419, userConfig.getAccount(), "获取历史开奖失败");
         }
 
-        // 解析 HTML 数据
-        Document doc = Jsoup.parse(result);
-        // 解析表格内容
-        Elements rows = doc.select("table.list tbody tr");
-        JSONArray results = new JSONArray();
-        int i = 0;
-        for (Element row : rows) {
-            Elements cols = row.select("td");
-            if (i > 50) {
-                break;
-            }
-            if (!cols.isEmpty()) {
-                // 组装 JSON 数据
-                JSONObject jsonObject = new JSONObject();
-                // 获取开奖号码
-                Elements ballElements = cols.select("td.name.ballname span");
-                // 提取 10 个位置结果
-                List<String> balls = ballElements.eachText();
-                // 提取最后 5 个龙虎结果
-                List<String> dragonTiger = new ArrayList<>();
-                dragonTiger.add(cols.get(15).text());    // 双面 龙虎 第一位
-                dragonTiger.add(cols.get(16).text());    // 双面 龙虎 第二位
-                dragonTiger.add(cols.get(17).text());    // 双面 龙虎 第三位
-                dragonTiger.add(cols.get(18).text());    // 双面 龙虎 第四位
-                dragonTiger.add(cols.get(19).text());    // 双面 龙虎 第五位
-                jsonObject.putOpt("period", cols.get(0).text());
-                jsonObject.putOpt("drawTime", cols.get(1).text());
-                jsonObject.putOpt("balls", balls);
-                jsonObject.putOpt("dragonTiger", dragonTiger);
-                results.add(jsonObject);
-                i++;
-            }
+        // === 关键：提取 returnData ===
+        Matcher matcher = RETURN_DATA_PATTERN.matcher(html);
+        if (!matcher.find()) {
+            log.warn("未找到 returnData，可能页面结构变更");
+            return new JSONArray();
         }
 
-        // 返回结果 JSON
-        return results;
+        String jsonArrayStr = matcher.group(1);
+
+        JSONArray sourceArray = JSONUtil.parseArray(jsonArrayStr);
+        JSONArray result = new JSONArray();
+
+        for (int i = 0; i < sourceArray.size(); i++) {
+            JSONObject src = sourceArray.getJSONObject(i);
+
+            JSONObject item = new JSONObject();
+            item.putOpt("period", src.getStr("round"));
+            item.putOpt("drawTime", src.getStr("openbet"));
+
+            item.putOpt("n1", src.getStr("n1"));
+            item.putOpt("n2", src.getStr("n1"));
+            item.putOpt("n3", src.getStr("n1"));
+
+            // hash（有些彩种会用）
+            item.putOpt("hash", src.getStr("hash"));
+
+            result.add(item);
+        }
+
+        return result;
     }
+
 
     /**
      * 获取指定期数开奖信息

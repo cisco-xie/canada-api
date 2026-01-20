@@ -15,7 +15,7 @@ public class PlanDoubleVO {
     @NotBlank(message = "游戏类型不能为空")
     @Schema(description = "游戏类型")
     private String lottery;
-    @Schema(description = "方案类型（1自定义2随机）")
+    @Schema(description = "方案类型（1号码投注2位置开号投注3灵活开某投某5号码追踪17冷热号投注25开某投某）")
     private Integer planType;
     @Schema(description = "翻倍类型（1默认翻倍老号 2翻倍新号 3翻老投新）")
     private Integer doubleType = 1;
@@ -57,15 +57,8 @@ public class PlanDoubleVO {
     @NotNull(message = "正投账号数量不能为空")
     @Schema(description = "正投账号数量")
     private Integer positiveAccountNum;
-    @NotNull(message = "反投账号数量不能为空")
-    @Schema(description = "反投账号数量")
-    private Integer reverseAccountNum;
     // 正投金额
     @NotBlank(message = "正投金额不能为空")
     @Schema(description = "正投金额")
     private String positiveAmount;
-    // 反投金额
-    @NotBlank(message = "反投金额不能为空")
-    @Schema(description = "反投金额")
-    private String reverseAmount;
 }

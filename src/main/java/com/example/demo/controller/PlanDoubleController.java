@@ -72,8 +72,7 @@ public class PlanDoubleController extends BaseController {
     public Result configPlan(@RequestBody @Validated PlanDoubleVO plan) {
         AdminLoginDTO admin = getUser();
         List<Integer> positiveAmounts = formatIds(plan.getPositiveAmount());
-        List<Integer> reverseAmounts = formatIds(plan.getReverseAmount());
-        if (plan.getMonitorNum() != positiveAmounts.size() || plan.getMonitorNum() != reverseAmounts.size()) {
+        if (plan.getMonitorNum() != positiveAmounts.size()) {
             throw new BusinessException(SystemError.PLAN_1200);
         }
         configService.planDouble(admin.getUsername(), plan);

@@ -62,6 +62,6 @@ public class TestController extends BaseController {
     @GetMapping("/dresults")
     public Result dresults(@RequestParam(value = "accountId", required = false) String accountId, @RequestParam(value = "lottery", required = false) String lottery) {
         AdminLoginDTO admin = getUser();
-        return Result.success(api.dresults(admin.getUsername(), accountId, lottery));
+        return Result.success(api.dresults(admin.getUsername(), accountId, null, 0));
     }
 }

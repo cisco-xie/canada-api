@@ -327,6 +327,18 @@ public class BasicController extends BaseController {
         return Result.success(JSONUtil.parseObj(api.settled(admin.getUsername(), id, settled, pageNo, false)));
     }
 
+    @Operation(summary = "获取注单详细赔率")
+    @GetMapping("/bet/detail")
+    @ResponseBody
+    public Result betDetail(@RequestParam String id,
+                            @RequestParam String betID,
+                            @RequestParam String gametype,
+                            @RequestParam String orderdt,
+                            @RequestParam(required = false) String wtype) {
+        AdminLoginDTO admin = getUser();
+        return Result.success(JSONUtil.parseObj(api.betDetail(admin.getUsername(), id, betID, gametype, orderdt, wtype)));
+    }
+
     @Operation(summary = "获取两周流水记录")
     @GetMapping("/history")
     @ResponseBody

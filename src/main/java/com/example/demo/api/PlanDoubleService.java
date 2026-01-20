@@ -33,6 +33,7 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.net.*;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
@@ -45,6 +46,44 @@ import java.util.stream.Collectors;
 @Slf4j
 @Component
 public class PlanDoubleService {
+
+    /**
+     * 投注位置信息（新API使用，不再使用betKey格式）
+     */
+    private static class BettingPositionInfo {
+        private Integer positionId;      // 位置ID（和值、球号、位置号等）
+        private String locationNum;      // 位置编号（用于位置开号投注等）
+        private String positionNum;      // 投注号码
+        private String idIndex;         // 新API的idIndex（根据游戏类型计算）
+        private String rate;            // 赔率（从rate数组获取）
+        private Integer ballNumber;      // 球号（用于OPN等）
+        private String betType;         // 投注类型（大/小/单/双/龙/虎，用于双面投注）
+        private Integer firstDigit;     // 第一位数字（用于二字定位、三字定位）
+        private Integer secondDigit;    // 第二位数字（用于二字定位、三字定位）
+        private Integer thirdDigit;     // 第三位数字（用于三字定位）
+        
+        // Getters and Setters
+        public Integer getPositionId() { return positionId; }
+        public void setPositionId(Integer positionId) { this.positionId = positionId; }
+        public String getLocationNum() { return locationNum; }
+        public void setLocationNum(String locationNum) { this.locationNum = locationNum; }
+        public String getPositionNum() { return positionNum; }
+        public void setPositionNum(String positionNum) { this.positionNum = positionNum; }
+        public String getIdIndex() { return idIndex; }
+        public void setIdIndex(String idIndex) { this.idIndex = idIndex; }
+        public String getRate() { return rate; }
+        public void setRate(String rate) { this.rate = rate; }
+        public Integer getBallNumber() { return ballNumber; }
+        public void setBallNumber(Integer ballNumber) { this.ballNumber = ballNumber; }
+        public String getBetType() { return betType; }
+        public void setBetType(String betType) { this.betType = betType; }
+        public Integer getFirstDigit() { return firstDigit; }
+        public void setFirstDigit(Integer firstDigit) { this.firstDigit = firstDigit; }
+        public Integer getSecondDigit() { return secondDigit; }
+        public void setSecondDigit(Integer secondDigit) { this.secondDigit = secondDigit; }
+        public Integer getThirdDigit() { return thirdDigit; }
+        public void setThirdDigit(Integer thirdDigit) { this.thirdDigit = thirdDigit; }
+    }
 
     @Resource(name = "defaultRedissonClient")
     private RedissonClient redisson;
@@ -211,12 +250,6 @@ public class PlanDoubleService {
                             toRemoveUsers.add(admin);
                             return;
                         }
-                        // 校验正反投账号
-                        List<UserConfig> validUserConfigs = validUserBetTypeAsync(admin, tokenValidConfigs).join();
-                        if (CollUtil.isEmpty(validUserConfigs)) {
-                            toRemoveUsers.add(admin);
-                            return;
-                        }
 
                         // 将有效方案添加到 map
                         enabledPlanDoublesMap.put(admin.getUsername(), enabledPlanDouble);
@@ -312,7 +345,7 @@ public class PlanDoubleService {
                 // 记录失败账号的监控期数id
                 Map<String, Map<Integer, String>> failedMonitorIds = new ConcurrentHashMap<>();
                 // ✅ 所有订单最终合并请求
-                Map<String, OrderVO> finalOrder = new ConcurrentHashMap<>();
+                Map<String, List<BetNew>> finalOrder = new ConcurrentHashMap<>();
                 // 获取方案列表中第一个所属游戏（前提是所有方案都是同一种游戏）
                 String lottery = enabledPlanDoubles.get(0).getLottery();
                 AtomicReference<String> drawNumber = new AtomicReference<>();
@@ -324,7 +357,6 @@ public class PlanDoubleService {
                 List<CompletableFuture<Void>> planFutures = new ArrayList<>();
                 for (PlanDoubleVO plan : enabledPlanDoubles) {
                     planFutures.add(CompletableFuture.runAsync(() -> {
-                        TimeInterval timer = DateUtil.timer();
                         Map<String, String> accountOdds = new ConcurrentHashMap<>();
                         // 校验当期是否需要跳过
                         JSONObject skip = configService.getMaxDatetimeNotice(username);
@@ -372,7 +404,7 @@ public class PlanDoubleService {
                         }
 
                         // 获取期数锁
-                        RLock lock = acquireBetLock(closeTime.get(), username, plan, drawNumber.get());
+                        RLock lock = acquireBetLock(drawTime.get(), username, plan, drawNumber.get());
                         if (lock == null) {
                             log.info("翻倍计划-平台用户:{},游戏:{},期数:{},方案:{},当前期数正在执行", username, plan.getLottery(), drawNumber.get(), plan.getName());
                             return;
@@ -381,7 +413,8 @@ public class PlanDoubleService {
                         // 获取正投账号数
                         List<UserConfig> positiveAccounts = getRandomAccount(tokenValidConfigs, plan.getPositiveAccountNum(), 1);
                         // 获取反投账号数
-                        List<UserConfig> reverseAccounts = getRandomAccount(tokenValidConfigs, plan.getReverseAccountNum(), 2);
+                        // List<UserConfig> reverseAccounts = getRandomAccount(tokenValidConfigs, plan.getReverseAccountNum(), 2);
+                        List<UserConfig> reverseAccounts = new ArrayList<>();
                         // 把正反投账号集合
                         List<UserConfig> allAccounts = new ArrayList<>();
                         allAccounts.addAll(positiveAccounts);
@@ -457,10 +490,15 @@ public class PlanDoubleService {
                         }
                         JSONObject oddsJson = JSONUtil.parseObj(odds);
 
-                        // 投注位置
-                        List<BetNew> order = new ArrayList<>();
-                        // 获取正反投的位置 key
-                        Map<Integer, Map<String, List<String>>> oddsMap = new HashMap<>();
+                        // 投注位置信息（新API：直接存储投注位置，不再使用betKey）
+                        // 普通投注位置：Map<位置ID, 投注位置信息>
+                        // 位置ID对于不同游戏类型含义不同：
+                        // - all: 和值 (0-27)
+                        // - OPN: 球号 (1-3)
+                        // - TPD/TPC/TPB: 位置号 (1-10)
+                        // - DW3: 位置号 (1-10)
+                        // - n5: 投注类型索引
+                        Map<Integer, BettingPositionInfo> oddsMap = new HashMap<>();
                         // 获取号码
                         List<PositionVO> positions = new ArrayList<>();
                         // 获取大小
@@ -471,28 +509,45 @@ public class PlanDoubleService {
                         Map<String, List<Integer>> twoSidedLhPositions = new HashMap<>();
 
                         List<Integer> amountKeys = new ArrayList<>();
+                        String wtype = plan.getLottery(); // 获取游戏类型
+                        
                         if (null != plan.getPositions()) {
                             String lastResult = null;
                             // 如果是类型2则获取最新开奖信息
                             if (1 == plan.getPlanType()) {
-                                log.info("翻倍计划-号码投注-平台用户:{},游戏:{},期数:{}", username, plan.getLottery(), drawNumber.get());
+                                log.info("翻倍计划-号码投注-平台用户:{},游戏:{},期数:{},wtype:{}", username, plan.getLottery(), drawNumber.get(), wtype);
                                 for (PositionVO pos : plan.getPositions()) {
                                     if (pos.getEnable() == 0) continue;
                                     boolean hasChinese = Validator.hasChinese(pos.getPositionNum());
                                     if (!hasChinese) {
                                         // 没有中文的一概以号码处理
-                                        List<Integer> ids = formatIds(pos.getPositionNum());
+                                        List<Integer> ids = formatIds(pos.getLocationNum());
                                         for (Integer id : ids) {
-                                            // 获取和值位置赔率，和值位置需要加1
-                                            String rate = oddsJson.getJSONArray("rate").getStr(id + 1);
-                                            BetNew betNew = new BetNew();
-                                            // 投注时下标需要减1
-                                            String idIndex = String.valueOf(id - 1);
-                                            List<String> matchedKeys = oddsJson.keySet().stream()
-                                                    .filter(matchedKey -> matchedKey.contains(idIndex))
-                                                    .collect(Collectors.toList());
-                                            Map<String, List<String>> oddKeys = getOdds(plan.getReverseType(), matchedKeys, pos.getPositionNum());
-                                            oddsMap.put(id, oddKeys);
+                                            // 新API：直接根据游戏类型和投注号码计算投注位置信息
+                                            BettingPositionInfo positionInfo = new BettingPositionInfo();
+                                            positionInfo.setPositionId(id);
+                                            positionInfo.setLocationNum(pos.getLocationNum());
+                                            positionInfo.setPositionNum(pos.getPositionNum());
+                                            
+                                            // 根据游戏类型计算idIndex和rate
+                                            if ("all".equals(wtype)) {
+                                                // 主势盘：投注号码就是和值
+                                                int sumValue = id;
+                                                positionInfo.setIdIndex(String.valueOf(sumValue + 1));
+                                                // 获取赔率：rate[和值 + 1]
+                                                if (oddsJson.containsKey("rate")) {
+                                                    JSONArray rateArray = oddsJson.getJSONArray("rate");
+                                                    if (rateArray != null && rateArray.size() > sumValue + 1) {
+                                                        positionInfo.setRate(rateArray.getStr(sumValue + 1));
+                                                    }
+                                                }
+                                            } else {
+                                                // 其他游戏类型：暂时标记，后续在createBetNewList中处理
+                                                positionInfo.setIdIndex(null); // 待计算
+                                                positionInfo.setRate(null); // 待计算
+                                            }
+                                            
+                                            oddsMap.put(id, positionInfo);
                                             amountKeys.add(id);
                                         }
                                         positions.add(pos);
@@ -533,17 +588,25 @@ public class PlanDoubleService {
 //                                                    .toList();
 //                                        }
                                         for (Integer id : ids) {
-                                            String jsonKey = "B" + id;
+                                            // 新API：直接根据游戏类型和投注位置创建BettingPositionInfo
+                                            BettingPositionInfo positionInfo = new BettingPositionInfo();
+                                            positionInfo.setPositionId(id);
+                                            positionInfo.setLocationNum(pos.getLocationNum());
+                                            positionInfo.setPositionNum(pos.getPositionNum());
+                                            
+                                            // 位置开号投注：根据开奖号码和位置计算投注位置信息
                                             List<Integer> locations = new ArrayList<>();
                                             List<Integer> locationIds = formatIds(pos.getLocationNum());
                                             for (Integer locationId : locationIds) {
                                                 locations.add(amountKeys.get(locationId - 1));
                                             }
-                                            List<String> matchedKeys = oddsJson.keySet().stream()
-                                                    .filter(matchedKey -> matchedKey.contains(jsonKey + "_"))
-                                                    .collect(Collectors.toList());
-                                            Map<String, List<String>> oddKeys = getOdds(plan.getReverseType(), matchedKeys, Joiner.on(",").join(locations));
-                                            oddsMap.put(id, oddKeys);
+                                            
+                                            // 根据游戏类型计算idIndex和rate（待实现具体逻辑）
+                                            // 暂时标记，后续在createBetNewList中根据实际投注号码计算
+                                            positionInfo.setIdIndex(null); // 待计算
+                                            positionInfo.setRate(null); // 待计算
+                                            
+                                            oddsMap.put(id, positionInfo);
                                         }
                                         positions.add(pos);
                                     }
@@ -575,13 +638,17 @@ public class PlanDoubleService {
 //                                                        .toList();
 //                                            }
                                             for (Integer posNumId : posNum) {
-                                                String jsonKey = "B" + posNumId;
-                                                List<String> matchedKeys = oddsJson.keySet().stream()
-                                                        .filter(matchedKey -> matchedKey.contains(jsonKey + "_"))
-                                                        .collect(Collectors.toList());
-                                                // 这个计划的位置数组需要使用Locations参数，由list转换成string
-                                                Map<String, List<String>> oddKeys = getOdds(plan.getReverseType(), matchedKeys, pos.getLocationNum());
-                                                oddsMap.put(posNumId, oddKeys);
+                                                // 新API：直接根据游戏类型和投注位置创建BettingPositionInfo
+                                                BettingPositionInfo positionInfo = new BettingPositionInfo();
+                                                positionInfo.setPositionId(posNumId);
+                                                positionInfo.setLocationNum(pos.getLocationNum());
+                                                positionInfo.setPositionNum(pos.getPositionNum());
+                                                
+                                                // 根据游戏类型计算idIndex和rate（待实现具体逻辑）
+                                                positionInfo.setIdIndex(null); // 待计算
+                                                positionInfo.setRate(null); // 待计算
+                                                
+                                                oddsMap.put(posNumId, positionInfo);
                                                 positions.add(pos);
                                             }
                                         }
@@ -643,12 +710,17 @@ public class PlanDoubleService {
 //                                            }
 
                                             for (Integer posNumId : posNum) {
-                                                String jsonKey = "B" + posNumId;
-                                                List<String> matchedKeys = oddsJson.keySet().stream()
-                                                        .filter(matchedKey -> matchedKey.contains(jsonKey + "_"))
-                                                        .collect(Collectors.toList());
-                                                Map<String, List<String>> oddKeys = getOdds(plan.getReverseType(), matchedKeys, pos.getLocationNum());
-                                                oddsMap.put(posNumId, oddKeys);
+                                                // 新API：直接根据游戏类型和投注位置创建BettingPositionInfo
+                                                BettingPositionInfo positionInfo = new BettingPositionInfo();
+                                                positionInfo.setPositionId(posNumId);
+                                                positionInfo.setLocationNum(pos.getLocationNum());
+                                                positionInfo.setPositionNum(pos.getPositionNum());
+                                                
+                                                // 根据游戏类型计算idIndex和rate（待实现具体逻辑）
+                                                positionInfo.setIdIndex(null); // 待计算
+                                                positionInfo.setRate(null); // 待计算
+                                                
+                                                oddsMap.put(posNumId, positionInfo);
                                                 amountKeys.add(posNumId);
                                             }
                                             positions.add(pos);
@@ -669,7 +741,7 @@ public class PlanDoubleService {
                                     );
                                     JSONArray dresults = JSONUtil.parseArray(businessUserRedissonClient.getBucket(drawKey).get());
                                     if (dresults == null || dresults.isEmpty()) {
-                                        dresults = handicapApi.dresults(username, tokenValidConfigs.get(0).getId(), plan.getLottery());
+                                        dresults = handicapApi.dresults(username, tokenValidConfigs.get(0).getId(), null, 0);
                                     }
                                     for (Object dresult : dresults) {
                                         JSONObject dresultJson = JSONUtil.parseObj(dresult);
@@ -678,7 +750,7 @@ public class PlanDoubleService {
                                         // 如果最新的开奖时间小于当前时间，between结果为负
                                         if (between < 0) {
                                             // 获取最新开奖结果并插入缓存中
-                                            dresults = handicapApi.dresults(username, tokenValidConfigs.get(0).getId(), plan.getLottery());
+                                            dresults = handicapApi.dresults(username, tokenValidConfigs.get(0).getId(), null, 0);
                                         }
                                         // 只获取最新一条开奖信息，所以执行完一遍后直接退出
                                         break;
@@ -716,13 +788,17 @@ public class PlanDoubleService {
 //                                                    .toList();
 //                                        }
                                         for (Integer id : ids) {
-                                            String jsonKey = "B" + id;
-                                            List<String> matchedKeys = oddsJson.keySet().stream()
-                                                    .filter(matchedKey -> matchedKey.contains(jsonKey + "_"))
-                                                    .collect(Collectors.toList());
-                                            // 这个计划的位置数组需要使用Locations参数，由list转换成string
-                                            Map<String, List<String>> oddKeys = getOdds(plan.getReverseType(), matchedKeys, locationNumBuilder.toString());
-                                            oddsMap.put(id, oddKeys);
+                                            // 新API：直接根据游戏类型和投注位置创建BettingPositionInfo
+                                            BettingPositionInfo positionInfo = new BettingPositionInfo();
+                                            positionInfo.setPositionId(id);
+                                            positionInfo.setLocationNum(locationNumBuilder.toString());
+                                            positionInfo.setPositionNum(pos.getPositionNum());
+                                            
+                                            // 根据游戏类型计算idIndex和rate（待实现具体逻辑）
+                                            positionInfo.setIdIndex(null); // 待计算
+                                            positionInfo.setRate(null); // 待计算
+                                            
+                                            oddsMap.put(id, positionInfo);
                                             positions.add(pos);
                                             amountKeys.add(id);
                                         }
@@ -756,13 +832,17 @@ public class PlanDoubleService {
                                         for (Integer location : plan.getLocations()) {
                                             // 最新开奖号码需要和设置的一致才进行投注
                                             if (Objects.equals(amountKeys.get(location - 1), id)) {
-                                                String jsonKey = "B" + location;
-                                                List<String> matchedKeys = oddsJson.keySet().stream()
-                                                        .filter(matchedKey -> matchedKey.contains(jsonKey + "_"))
-                                                        .collect(Collectors.toList());
-                                                // 这个计划的位置数组需要使用Locations参数，由list转换成string
-                                                Map<String, List<String>> oddKeys = getOdds(plan.getReverseType(), matchedKeys, pos.getPositionNum());
-                                                oddsMap.put(location, oddKeys);
+                                                // 新API：直接根据游戏类型和投注位置创建BettingPositionInfo
+                                                BettingPositionInfo positionInfo = new BettingPositionInfo();
+                                                positionInfo.setPositionId(location);
+                                                positionInfo.setLocationNum(String.valueOf(location));
+                                                positionInfo.setPositionNum(pos.getPositionNum());
+                                                
+                                                // 根据游戏类型计算idIndex和rate（待实现具体逻辑）
+                                                positionInfo.setIdIndex(null); // 待计算
+                                                positionInfo.setRate(null); // 待计算
+                                                
+                                                oddsMap.put(location, positionInfo);
                                                 positions.add(pos);
                                             }
                                         }
@@ -780,7 +860,7 @@ public class PlanDoubleService {
                                 username,
                                 String.valueOf(plan.getId())
                         );
-                        List<JSONObject> monitorInfos = businessUserRedissonClient.getList(monitorKey);
+                        RList<JSONObject> monitorInfos = businessUserRedissonClient.getList(monitorKey);
                         // 本期轮数值，根据轮数获取需要投注的金额
                         Integer rounds = 0;
                         // 下注线程池
@@ -809,16 +889,17 @@ public class PlanDoubleService {
                                 monitorInfo.putOpt("drawNumber", drawNumber.get());   // 期数
                                 monitorInfo.putOpt("rounds", 0);                // 监控轮次从第一期开始
                                 monitorInfo.putOpt("createTime", LocalDateTimeUtil.formatNormal(LocalDateTime.now()));
-                                monitorInfos = new ArrayList<>();
+                                // 直接使用RList，不要创建新的ArrayList
+                                monitorInfos.clear();
                                 monitorInfos.add(monitorInfo);
                             }
                             // 配置监控轮次
                             roundsMap.put(plan.getId(), rounds);
-                            // 记录当前计划对应的monitorInfos
-                            useMonitorInfos.put(plan.getId(), monitorInfos);
+                            // 记录当前计划对应的monitorInfos（转换为List用于useMonitorInfos）
+                            useMonitorInfos.put(plan.getId(), new ArrayList<>(monitorInfos));
                             // 使用 CountDownLatch 等待所有延迟任务完成
-                            JSONObject twoSidedAmountJson = twoSidedAmountJson(oddsJson, twoSidedDxPositions, twoSidedDsPositions, twoSidedLhPositions, positiveAccounts, reverseAccounts, plan, rounds);
-                            JSONObject amountJson = distributeAmount(oddsMap, positiveAccounts, reverseAccounts, plan, rounds);
+                            JSONObject twoSidedAmountJson = twoSidedAmountJson(oddsJson, wtype, twoSidedDxPositions, twoSidedDsPositions, twoSidedLhPositions, allAccounts, plan, rounds);
+                            JSONObject amountJson = distributeAmount(oddsMap, oddsJson, wtype, allAccounts, plan, rounds);
                             if ((twoSidedAmountJson == null || twoSidedAmountJson.isEmpty()) && amountJson.isEmpty()) {
                                 log.info("翻倍计划-获取分配金额全部为空,跳出任务 平台用户:{}, 游戏:{},期数:{},方案:{}", username, plan.getLottery(), drawNumber.get(), plan.getName());
                                 return;
@@ -847,17 +928,18 @@ public class PlanDoubleService {
                                 monitorInfo.putOpt("drawNumber", drawNumber.get());   // 期数
                                 monitorInfo.putOpt("rounds", 0);                // 监控轮次从第一期开始
                                 monitorInfo.putOpt("createTime", LocalDateTimeUtil.formatNormal(LocalDateTime.now()));
-                                monitorInfos = new ArrayList<>();
+                                // 直接使用RList，不要创建新的ArrayList
+                                monitorInfos.clear();
                                 monitorInfos.add(monitorInfo);
                             }
                             // 配置监控轮次
                             roundsMap.put(plan.getId(), rounds);
-                            // 记录当前计划对应的monitorInfos
-                            useMonitorInfos.put(plan.getId(), monitorInfos);
+                            // 记录当前计划对应的monitorInfos（转换为List用于useMonitorInfos）
+                            useMonitorInfos.put(plan.getId(), new ArrayList<>(monitorInfos));
                             // 使用 CountDownLatch 等待所有延迟任务完成
                             // CountDownLatch latch = new CountDownLatch(allAccounts.size()); // 初始化为需要执行的任务数
-                            JSONObject twoSidedAmountJson = twoSidedAmountJson(oddsJson, twoSidedDxPositions, twoSidedDsPositions, twoSidedLhPositions, positiveAccounts, reverseAccounts, plan, rounds);
-                            JSONObject amountJson = distributeAmount(oddsMap, positiveAccounts, reverseAccounts, plan, rounds);
+                            JSONObject twoSidedAmountJson = twoSidedAmountJson(oddsJson, wtype, twoSidedDxPositions, twoSidedDsPositions, twoSidedLhPositions, allAccounts, plan, rounds);
+                            JSONObject amountJson = distributeAmount(oddsMap, oddsJson, wtype, allAccounts, plan, rounds);
                             if ((twoSidedAmountJson == null || twoSidedAmountJson.isEmpty()) && (amountJson == null || amountJson.isEmpty())) {
                                 log.info("翻倍计划-获取分配金额全部为空,跳出任务 平台用户:{}, 游戏:{},期数:{},方案:{}", username, plan.getLottery(), drawNumber.get(), plan.getName());
                                 return;
@@ -872,20 +954,17 @@ public class PlanDoubleService {
                             PriorityTaskExecutor.shutdownExecutor(executorBetService);
                         } else if (3 == plan.getDoubleType()) {
                             // 翻老投新,不用管上一期中不中,每期都是第一轮期数的金额
-                            if (monitorInfos == null || monitorInfos.isEmpty()) {
-                                monitorInfos = new ArrayList<>();
-                            }
-
                             // 配置监控轮次
                             roundsMap.put(plan.getId(), rounds);
-                            // 记录当前计划对应的monitorInfos
-                            useMonitorInfos.put(plan.getId(), monitorInfos);
+                            // 记录当前计划对应的monitorInfos（转换为List用于useMonitorInfos）
+                            useMonitorInfos.put(plan.getId(), new ArrayList<>(monitorInfos));
                             JSONObject monitorInfo = new JSONObject();
                             monitorInfo.putOpt("id", IdUtil.getSnowflakeNextIdStr());     // 期数ID
                             monitorInfo.putOpt("planId", plan.getId());     // 计划ID
                             monitorInfo.putOpt("drawNumber", drawNumber.get());   // 期数
                             monitorInfo.putOpt("rounds", 0);                // 监控轮次从第一期开始
                             monitorInfo.putOpt("createTime", LocalDateTimeUtil.formatNormal(LocalDateTime.now()));
+                            // 直接使用RList添加，会自动同步到Redis
                             monitorInfos.add(monitorInfo);
                             // 获取当前最新的监控期数，用于使用第几轮的投注金额
                             for (Object info : monitorInfos) {
@@ -894,8 +973,8 @@ public class PlanDoubleService {
 
                                 // 使用 CountDownLatch 等待所有延迟任务完成
                                 // CountDownLatch latch = new CountDownLatch(allAccounts.size()); // 初始化为需要执行的任务数
-                                JSONObject twoSidedAmountJson = twoSidedAmountJson(oddsJson, twoSidedDxPositions, twoSidedDsPositions, twoSidedLhPositions, positiveAccounts, reverseAccounts, plan, rounds);
-                                JSONObject amountJson = distributeAmount(oddsMap, positiveAccounts, reverseAccounts, plan, monitorInfoJson.getInt("rounds"));
+                                JSONObject twoSidedAmountJson = twoSidedAmountJson(oddsJson, wtype, twoSidedDxPositions, twoSidedDsPositions, twoSidedLhPositions, allAccounts, plan, rounds);
+                                JSONObject amountJson = distributeAmount(oddsMap, oddsJson, wtype, allAccounts, plan, monitorInfoJson.getInt("rounds"));
                                 if ((twoSidedAmountJson == null || twoSidedAmountJson.isEmpty()) && (amountJson == null || amountJson.isEmpty())) {
                                     log.info("翻倍计划-获取分配金额全部为空,跳出任务 平台用户:{}, 游戏:{},期数:{},方案:{}", username, plan.getLottery(), drawNumber.get(), plan.getName());
                                     return;
@@ -1016,7 +1095,7 @@ public class PlanDoubleService {
                         });
                     }
 
-                    long drawTimeDelay = drawTime.get() - System.currentTimeMillis();
+                    long drawTimeDelay = drawTime.get();
                     // 计算距离开奖还是多少时间 ms
                     // 阻塞线程进行延迟时间查询开奖信息,加10秒是确保这时已经开奖了
                     try {
@@ -1168,16 +1247,17 @@ public class PlanDoubleService {
      * @param successUserCount
      * @param failureUserCount
      */
-    private void retryBet(String username, PlanDoubleVO plan, Map<String, OrderVO> finalOrder, String monitorId, JSONObject monitorInfo, String drawNumber, long closeTime, Long drawTime,
+    private void retryBet(String username, PlanDoubleVO plan, Map<String, List<BetNew>> finalOrder, String monitorId, JSONObject monitorInfo, String drawNumber, long closeTime, Long drawTime,
                           JSONObject oddsJson, List<UserConfig> allAccounts, List<UserConfig> positiveAccounts, List<UserConfig> reverseAccounts, List<UserConfig> successAccounts, List<UserConfig> failedAccounts, Map<String, Map<Integer, String>> useMonitorIds, Map<String, Map<Integer, String>> failedMonitorIds, List<PositionVO> positions, JSONObject amountJson, JSONObject twoSidedAmountJson,
                           AtomicInteger successCount, AtomicInteger failureCount, AtomicInteger successUserCount, AtomicInteger failureUserCount, List<Integer> amountKeys, ExecutorService executorBetService) {
 
         log.info("翻倍计划-开始执行投注, 平台用户:{},游戏:{},期数:{},方案:{}, 监控ID: {}, 监控信息: {}, 执行用户: {}", username, plan.getLottery(), drawNumber, plan.getName(), monitorId, monitorInfo, allAccounts);
-        // 计算新的投注金额
+        // 获取游戏类型
+        String wtype = plan.getLottery();
+        // 计算新的投注金额（合并正投和反投金额，统一使用所有账号）
         List<Integer> positiveAmounts = formatIds(plan.getPositiveAmount());
-        List<Integer> reverseAmounts = formatIds(plan.getReverseAmount());
-        JSONObject newPositiveAmountJson = distributeAmountsForAccounts(positiveAccounts, positiveAmounts.get(monitorInfo.getInt("rounds")));
-        JSONObject newReverseAmountJson = distributeAmountsForAccounts(reverseAccounts, reverseAmounts.get(monitorInfo.getInt("rounds")));
+        int totalAmount = positiveAmounts.get(monitorInfo.getInt("rounds"));
+        JSONObject newTotalAmountJson = distributeAmountsForAccounts(allAccounts, totalAmount);
 
         // 在遍历下注操作时，使用线程池异步执行每个下注操作
         List<CompletableFuture<Void>> betFutures = new ArrayList<>();
@@ -1255,93 +1335,90 @@ public class PlanDoubleService {
                             }
                         }
 
-                        String betTypeStr = userConfig.getBetType() == 1 ? "positive" : "reverse";
-
-                        // 计算延迟时间
-                        // long delay = calculateRemainingTime(closeTime, userConfig.getCloseTime());
-                        // delay = Math.max(delay, 0); // 确保延迟时间非负数
-
-                        // log.info("平台用户:{},游戏:{},期数:{},封盘时间:{},账号:{},方案:{}, 及时延迟下注", username, plan.getLottery(), drawNumber, closeTime, userConfig.getAccount(), plan.getName());
-                        // 延迟下注任务
-                        // scheduledExecutorService.schedule(() -> {
+                        // 创建下注请求参数（使用BetNew）
                         String orderKey = KeyUtil.genKey(
                                 RedisConstants.USER_BET_ORDER_DOUBLE_PREFIX,
                                 plan.getLottery(),
                                 username,
                                 String.valueOf(plan.getId()),
-                                betTypeStr,
-                                userConfig.getAccount(), // 新增这一项，确保账号维度隔离
+                                "all", // 不再区分正投/反投
+                                userConfig.getAccount(),
                                 monitorInfo.getStr("id")
                         );
-                        // 创建下注请求参数
-                        OrderVO order = new OrderVO();
+                        
+                        List<BetNew> betNewList;
                         if (1 == plan.getDoubleType()) {
                             if (plan.getMonitorNum() <= 1) {
-                                order = createOrder(username, monitorId, plan, oddsJsonNew, drawNumber, betTypeStr, amountJson, twoSidedAmountJson, userConfig, amountKeys);
+                                betNewList = createBetNewList(username, monitorId, plan, oddsJsonNew, drawNumber, amountJson, twoSidedAmountJson, userConfig, wtype);
                             } else {
                                 Object objRedis = businessUserRedissonClient.getBucket(orderKey).get();
                                 if (Objects.isNull(objRedis)) {
-                                    order = createOrder(username, monitorId, plan, oddsJsonNew, drawNumber, betTypeStr, amountJson, twoSidedAmountJson, userConfig, amountKeys);
-                                    businessUserRedissonClient.getBucket(orderKey).set(JSONUtil.parseObj(order));
+                                    betNewList = createBetNewList(username, monitorId, plan, oddsJsonNew, drawNumber, amountJson, twoSidedAmountJson, userConfig, wtype);
+                                    businessUserRedissonClient.getBucket(orderKey).set(JSONUtil.toJsonStr(betNewList));
                                 } else {
                                     log.info("翻倍老号-开始获取老号的下单记录, 执行用户: {}, 老号下单记录: {}", userConfig.getAccount(), objRedis);
                                     // 获取老号的下单记录
-                                    order = JSONUtil.toBean(String.valueOf(objRedis), OrderVO.class);
-                                    // 更新期数和金额
-                                    order.setDrawNumber(drawNumber);
-                                    for (Bet bet : order.getBets()) {
-                                        if (StringUtils.equals("positive", betTypeStr)) {
-                                            bet.setAmount(newPositiveAmountJson.getInt(userConfig.getAccount()));
-                                        } else {
-                                            bet.setAmount(newReverseAmountJson.getInt(userConfig.getAccount()));
-                                        }
+                                    betNewList = JSONUtil.toList(String.valueOf(objRedis), BetNew.class);
+                                    // 更新金额
+                                    int accountAmount = newTotalAmountJson.getInt(userConfig.getAccount());
+                                    for (BetNew betNew : betNewList) {
+                                        betNew.setAmount(String.valueOf(accountAmount));
                                     }
                                 }
                             }
                         } else if (2 == plan.getDoubleType()) {
-                            order = createOrder(username, monitorId, plan, oddsJsonNew, drawNumber, betTypeStr, amountJson, twoSidedAmountJson, userConfig, amountKeys);
+                            betNewList = createBetNewList(username, monitorId, plan, oddsJsonNew, drawNumber, amountJson, twoSidedAmountJson, userConfig, wtype);
                         } else if (3 == plan.getDoubleType()) {
                             if (plan.getMonitorNum() <= 1) {
-                                order = createOrder(username, monitorId, plan, oddsJsonNew, drawNumber, betTypeStr, amountJson, twoSidedAmountJson, userConfig, amountKeys);
+                                betNewList = createBetNewList(username, monitorId, plan, oddsJsonNew, drawNumber, amountJson, twoSidedAmountJson, userConfig, wtype);
                             } else {
                                 Object objRedis = businessUserRedissonClient.getBucket(orderKey).get();
                                 if (Objects.isNull(objRedis)) {
-                                    order = createOrder(username, monitorId, plan, oddsJsonNew, drawNumber, betTypeStr, amountJson, twoSidedAmountJson, userConfig, amountKeys);
-                                    businessUserRedissonClient.getBucket(orderKey).set(JSONUtil.parseObj(order));
+                                    betNewList = createBetNewList(username, monitorId, plan, oddsJsonNew, drawNumber, amountJson, twoSidedAmountJson, userConfig, wtype);
+                                    businessUserRedissonClient.getBucket(orderKey).set(JSONUtil.toJsonStr(betNewList));
                                 } else {
                                     log.info("翻老投新-开始获取老号的下单记录, 执行用户: {}, 老号下单记录: {}", userConfig.getAccount(), objRedis);
                                     // 获取翻老投新的下单记录
-                                    order = JSONUtil.toBean(String.valueOf(objRedis), OrderVO.class);
-                                    // 更新期数和金额
-                                    order.setDrawNumber(drawNumber);
-                                    for (Bet bet : order.getBets()) {
-                                        if (StringUtils.equals("positive", betTypeStr)) {
-                                            bet.setAmount(newPositiveAmountJson.getInt(userConfig.getAccount()));
-                                        } else {
-                                            bet.setAmount(newReverseAmountJson.getInt(userConfig.getAccount()));
-                                        }
+                                    betNewList = JSONUtil.toList(String.valueOf(objRedis), BetNew.class);
+                                    // 更新金额
+                                    int accountAmount = newTotalAmountJson.getInt(userConfig.getAccount());
+                                    for (BetNew betNew : betNewList) {
+                                        betNew.setAmount(String.valueOf(accountAmount));
                                     }
                                 }
                             }
+                        } else {
+                            betNewList = createBetNewList(username, monitorId, plan, oddsJsonNew, drawNumber, amountJson, twoSidedAmountJson, userConfig, wtype);
                         }
-                        if (order.getBets().isEmpty()) {
+                        
+                        if (betNewList == null || betNewList.isEmpty()) {
                             log.info("翻倍计划-平台用户:{},游戏:{},期数:{},账号:{},方案:{},没有可下注的号码", username, plan.getLottery(), drawNumber, userConfig.getAccount(), plan.getName());
                             return;
                         }
-                        log.info("翻倍计划-平台用户:{},游戏:{},期数:{},账号:{},方案:{},投注请求:{},将投注请求插入到finalOrder中,插入前:{}", username, plan.getLottery(), drawNumber, userConfig.getAccount(), plan.getName(), JSONUtil.parseObj(order), finalOrder);
-                        // 安全获取或创建OrderVO
-                        OrderVO orderCopy = order;
-                        finalOrder.compute(account, (k, existingOrder) -> {
-                            if (existingOrder == null) {
-                                return orderCopy;
+                        
+                        log.info("翻倍计划-平台用户:{},游戏:{},期数:{},账号:{},方案:{},BetNew数量:{},将投注请求插入到finalOrder中,插入前:{}", 
+                                username, plan.getLottery(), drawNumber, userConfig.getAccount(), plan.getName(), betNewList.size(), finalOrder);
+                        
+                        // 安全获取或创建BetNew列表
+                        finalOrder.compute(account, (k, existingList) -> {
+                            if (existingList == null) {
+                                return new ArrayList<>(betNewList);
                             } else {
-                                existingOrder.getBets().addAll(orderCopy.getBets());
-                                return existingOrder;
+                                existingList.addAll(betNewList);
+                                return existingList;
                             }
                         });
-                        log.info("翻倍计划-平台用户:{},游戏:{},期数:{},账号:{},方案:{},投注请求:{},将投注请求插入到finalOrder中,插入后:{}", username, plan.getLottery(), drawNumber, userConfig.getAccount(), plan.getName(), JSONUtil.parseObj(order), finalOrder);
+                        
+                        log.info("翻倍计划-平台用户:{},游戏:{},期数:{},账号:{},方案:{},BetNew数量:{},将投注请求插入到finalOrder中,插入后:{}", 
+                                username, plan.getLottery(), drawNumber, userConfig.getAccount(), plan.getName(), betNewList.size(), finalOrder);
 
                         // 记录订单请求
+                        JSONObject orderRecord = new JSONObject();
+                        orderRecord.put("lottery", plan.getLottery());
+                        orderRecord.put("drawNumber", drawNumber);
+                        orderRecord.put("wtype", plan.getLottery());
+                        orderRecord.put("betNewList", betNewList);
+                        
                         redisson.getBucket(KeyUtil.genKey(
                                 RedisConstants.USER_BET_DOUBLE_PERIOD_REQ_PREFIX,
                                 plan.getLottery(),
@@ -1351,7 +1428,7 @@ public class PlanDoubleService {
                                 String.valueOf(plan.getId()),
                                 monitorId,
                                 userConfig.getAccount()
-                        )).set(JSONUtil.toJsonStr(order), Duration.ofHours(24));
+                        )).set(JSONUtil.toJsonStr(orderRecord), Duration.ofHours(24));
 
                         // 提交下注
                         // String result = submitOrder(username, order, userConfig, plan, drawNumber, monitorId, closeTime);
@@ -1405,29 +1482,101 @@ public class PlanDoubleService {
         Map<String, List<String>> gameContentsMap = new HashMap<>();
         List<String> balls = new ArrayList<>();
         for (UserConfig userConfig : positiveAccounts) {
-            // 获取指定期数开奖信息
+            // 获取指定期数开奖信息（使用新API的odds方法）
             String drawKey = KeyUtil.genKey(
                     RedisConstants.DRAW_RESULT_PREFIX,
                     plan.getLottery(),
                     drawNumber
             );
-            JSONObject dresult = JSONUtil.parseObj(businessUserRedissonClient.getBucket(drawKey).get());
-            if (dresult == null || dresult.isEmpty()) {
-                dresult = handicapApi.dresult(username, userConfig.getId(), plan.getLottery(), drawNumber);
-            } else {
-                if (dresult.getJSONArray("balls").isEmpty() && dresult.getJSONArray("dragonTiger").isEmpty()) {
-                    dresult = handicapApi.dresult(username, userConfig.getId(), plan.getLottery(), drawNumber);
+            JSONObject drawResult = JSONUtil.parseObj(businessUserRedissonClient.getBucket(drawKey).get());
+            
+            // 如果缓存中没有开奖信息，或者开奖信息不完整，则调用odds API获取
+            if (drawResult == null || drawResult.isEmpty() || 
+                StringUtils.isBlank(drawResult.getStr("bnum")) || 
+                !drawNumber.equals(drawResult.getStr("gid"))) {
+                
+                // 使用odds方法获取开奖信息（默认使用主势盘all）
+                String wtype = "all"; // 默认使用主势盘
+                try {
+                    String oddsResult = handicapApi.odds(username, userConfig.getId(), wtype);
+                    JSONObject oddsJson = JSONUtil.parseObj(oddsResult);
+                    
+                    if (oddsJson.getInt("title", 0) == 1) {
+                        // 检查返回的期数是否匹配
+                        String currentGid = oddsJson.getStr("gid");
+                        String currentBr = oddsJson.getStr("br"); // 上一期期数
+                        String currentBnum = oddsJson.getStr("bnum"); // 上一期开奖号码
+                        
+                        // 如果当前期数匹配，说明已经开奖，可以从bnum获取开奖结果
+                        // 如果br匹配，说明bnum就是我们要找的开奖结果
+                        if (drawNumber.equals(currentGid) || drawNumber.equals(currentBr)) {
+                            drawResult = new JSONObject();
+                            drawResult.putOpt("gid", drawNumber.equals(currentBr) ? currentBr : currentGid);
+                            drawResult.putOpt("bnum", currentBnum);
+                            drawResult.putOpt("drawNumber", drawNumber);
+                            
+                            // 解析开奖号码（格式：5,6,6）
+                            if (StringUtils.isNotBlank(currentBnum)) {
+                                String[] ballArray = currentBnum.split(",");
+                                JSONArray ballsArray = new JSONArray();
+                                for (String ball : ballArray) {
+                                    ballsArray.add(ball.trim());
+                                }
+                                drawResult.putOpt("balls", ballsArray);
+                            }
+                        } else {
+                            // 如果期数不匹配，可能需要查询下一期的odds来获取当前期数的开奖结果
+                            // 或者等待当前期数开奖后再查询
+                            log.warn("翻倍计划-期数不匹配-平台用户:{},账号:{}, 期数:{}, 方案:{}, 当前gid:{}, br:{}", 
+                                    username, userConfig.getAccount(), drawNumber, plan.getName(), currentGid, currentBr);
+                            // 尝试从br和bnum获取（如果br是我们要找的期数）
+                            if (drawNumber.equals(currentBr) && StringUtils.isNotBlank(currentBnum)) {
+                                drawResult = new JSONObject();
+                                drawResult.putOpt("gid", currentBr);
+                                drawResult.putOpt("bnum", currentBnum);
+                                drawResult.putOpt("drawNumber", drawNumber);
+                                
+                                // 解析开奖号码
+                                String[] ballArray = currentBnum.split(",");
+                                JSONArray ballsArray = new JSONArray();
+                                for (String ball : ballArray) {
+                                    ballsArray.add(ball.trim());
+                                }
+                                drawResult.putOpt("balls", ballsArray);
+                            } else {
+                                log.info("翻倍计划-获取开奖信息失败-平台用户:{},账号:{}, 期数:{}, 方案:{}, 期数不匹配或未开奖", 
+                                        username, userConfig.getAccount(), drawNumber, plan.getName());
+                                return;
+                            }
+                        }
+                    } else {
+                        log.warn("翻倍计划-odds API返回失败-平台用户:{},账号:{}, 期数:{}, 方案:{}", 
+                                username, userConfig.getAccount(), drawNumber, plan.getName());
+                        return;
+                    }
+                } catch (Exception e) {
+                    log.error("翻倍计划-调用odds API异常-平台用户:{},账号:{}, 期数:{}, 方案:{}", 
+                            username, userConfig.getAccount(), drawNumber, plan.getName(), e);
+                    return;
                 }
             }
-            if (dresult == null || dresult.isEmpty() || dresult.getJSONArray("balls").isEmpty() || dresult.getJSONArray("dragonTiger").isEmpty()) {
-                log.info("翻倍计划-获取开奖信息失败-平台用户:{},账号:{}, 期数:{}, 方案:{}, 开奖信息{}", username, userConfig.getAccount(), drawNumber, plan.getName(), dresult);
+            
+            // 验证开奖信息是否完整
+            JSONArray ballsArray = drawResult.getJSONArray("balls");
+            if (drawResult == null || drawResult.isEmpty() || ballsArray == null || ballsArray.isEmpty()) {
+                log.info("翻倍计划-获取开奖信息失败-平台用户:{},账号:{}, 期数:{}, 方案:{}, 开奖信息不完整:{}", 
+                        username, userConfig.getAccount(), drawNumber, plan.getName(), drawResult);
                 return;
             }
-            log.info("翻倍计划-获取开奖信息-平台用户:{},账号:{}, 期数:{}, 方案:{}, 开奖信息{}", username, userConfig.getAccount(), drawNumber, plan.getName(), dresult);
-            // 每期开奖信息保存10分钟即可
-            businessUserRedissonClient.getBucket(drawKey).set(dresult, Duration.ofMinutes(10));
+            
+            log.info("翻倍计划-获取开奖信息-平台用户:{},账号:{}, 期数:{}, 方案:{}, 开奖信息{}", 
+                    username, userConfig.getAccount(), drawNumber, plan.getName(), drawResult);
+            
+            // 每期开奖信息永久保存（移除Duration限制）
+            businessUserRedissonClient.getBucket(drawKey).set(drawResult);
+            
             // 解析开奖单号
-            balls = dresult.getJSONArray("balls").toList(String.class);
+            balls = ballsArray.toList(String.class);
             String orderReqKey = KeyUtil.genKey(
                     RedisConstants.USER_BET_DOUBLE_PERIOD_REQ_PREFIX,
                     plan.getLottery(),
@@ -1443,17 +1592,52 @@ public class PlanDoubleService {
                 log.info("翻倍计划-校验中号结果-获取订单请求为空-平台用户:{},账号:{}, 期数:{}, 方案:{}", username, userConfig.getAccount(), drawNumber, plan.getName());
                 return;
             }
-            JSONArray betsArray = orderReq.getJSONArray("bets");
-            // 遍历 bets 数组
-            for (int i = 0; i < betsArray.size(); i++) {
-                JSONObject bet = betsArray.getJSONObject(i);
-                String game = bet.getStr("game");
-                String contents = bet.getStr("contents");
-                // 存入 map
-                gameContentsMap.computeIfAbsent(game, k -> new ArrayList<>()).add(contents);
+            
+            // 新API订单结构：betNewList包含BetNew对象数组
+            JSONArray betNewListArray = orderReq.getJSONArray("betNewList");
+            if (betNewListArray == null || betNewListArray.isEmpty()) {
+                log.info("翻倍计划-校验中号结果-订单请求中betNewList为空-平台用户:{},账号:{}, 期数:{}, 方案:{}", 
+                        username, userConfig.getAccount(), drawNumber, plan.getName());
+                return;
             }
+            
+            // 遍历 betNewList 数组，提取投注的idIndex（对应和值）
+            List<String> betIdIndexes = new ArrayList<>();
+            for (int i = 0; i < betNewListArray.size(); i++) {
+                JSONObject betNew = betNewListArray.getJSONObject(i);
+                String idIndex = betNew.getStr("idIndex");
+                if (StringUtils.isNotBlank(idIndex)) {
+                    betIdIndexes.add(idIndex);
+                }
+            }
+            // 存入 map（key为账号，value为投注的idIndex列表）
+            gameContentsMap.put(userConfig.getAccount(), betIdIndexes);
         }
-        log.info("翻倍计划-校验中号结果-平台用户:{}, 期数:{}, 方案:{}, 开奖位置信息:{}, 投注位置:{}", username, drawNumber, plan.getName(), balls, gameContentsMap);
+        
+        // 计算开奖和值（加拿大28：三个球的和值）
+        int drawSumValue = -1;
+        if (CollUtil.isNotEmpty(balls) && balls.size() >= 3) {
+            try {
+                int sum = 0;
+                for (String ball : balls) {
+                    sum += Integer.parseInt(ball.trim());
+                }
+                drawSumValue = sum;
+                log.info("翻倍计划-校验中号结果-平台用户:{}, 期数:{}, 方案:{}, 开奖号码:{}, 和值:{}", 
+                        username, drawNumber, plan.getName(), balls, drawSumValue);
+            } catch (NumberFormatException e) {
+                log.error("翻倍计划-计算开奖和值失败-平台用户:{}, 期数:{}, 方案:{}, 开奖号码:{}", 
+                        username, drawNumber, plan.getName(), balls, e);
+                return;
+            }
+        } else {
+            log.warn("翻倍计划-开奖号码数量不足-平台用户:{}, 期数:{}, 方案:{}, 开奖号码:{}", 
+                    username, drawNumber, plan.getName(), balls);
+            return;
+        }
+        
+        log.info("翻倍计划-校验中号结果-平台用户:{}, 期数:{}, 方案:{}, 开奖和值:{}, 投注位置:{}", 
+                username, drawNumber, plan.getName(), drawSumValue, gameContentsMap);
 
         // ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(10);
         // scheduler.schedule(() -> {
@@ -1474,17 +1658,24 @@ public class PlanDoubleService {
             configService.clearMonitor(username, plan.getLottery(), String.valueOf(plan.getId()));
             return;
         }
-        if (CollUtil.isNotEmpty(balls) && CollUtil.isNotEmpty(gameContentsMap)) {
-            List<String> finalBalls = balls;
-            // 遍历下单的位置，然后与开奖信息位置对比是否投中
-            gameContentsMap.forEach((game, contents) -> {
-                String content = finalBalls.get(Integer.parseInt(game.replaceAll("B", "")) - 1);
-                if (contents.contains(content)) {
+        
+        if (drawSumValue >= 0 && CollUtil.isNotEmpty(gameContentsMap)) {
+            // 新API投注位置格式：idIndex对应和值（idIndex=1对应和值0，idIndex=2对应和值1，以此类推）
+            // 开奖和值对应的idIndex = drawSumValue + 1
+            String winningIdIndex = String.valueOf(drawSumValue + 1);
+            
+            // 遍历所有账号的投注位置
+            gameContentsMap.forEach((account, idIndexes) -> {
+                // 检查该账号的投注idIndex列表中是否包含中奖的idIndex
+                if (idIndexes != null && idIndexes.contains(winningIdIndex)) {
                     // 当前投注中了
                     winNum.getAndIncrement();
+                    log.info("翻倍计划-账号中号-平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 投注idIndex:{}, 中奖idIndex:{}", 
+                            username, account, drawNumber, plan.getName(), idIndexes, winningIdIndex);
                 }
             });
-            log.info("翻倍计划-校验中号结果-平台用户:{}, 期数:{}, 方案:{}, 实际中号数:{}", username, drawNumber, plan.getName(), winNum.get());
+            log.info("翻倍计划-校验中号结果-平台用户:{}, 期数:{}, 方案:{}, 开奖和值:{}, 中奖idIndex:{}, 实际中号数:{}", 
+                    username, drawNumber, plan.getName(), drawSumValue, winningIdIndex, winNum.get());
 
             boolean isAchieved;  // 判断是否达标
             if (1 == plan.getSettleType()) {
@@ -1500,7 +1691,7 @@ public class PlanDoubleService {
                     username,
                     String.valueOf(plan.getId())
             );
-            List<JSONObject> monitorInfos = businessUserRedissonClient.getList(monitorKey);
+            RList<JSONObject> monitorInfos = businessUserRedissonClient.getList(monitorKey);
             JSONObject monitorInfo = new JSONObject();
             if (monitorInfos.isEmpty()) {
                 log.info("翻倍计划-校验中号结果-平台用户:{}, 期数:{}, 方案:{}, 实际中号数:{}, 第1次投注isAchieved:{}, orderKey:{}, 监控期数id:{}", username, drawNumber, plan.getName(), winNum.get(), isAchieved, orderPositiveKey, monitorId);
@@ -1700,59 +1891,73 @@ public class PlanDoubleService {
      * @param twoSidedDxPositions
      * @param twoSidedDsPositions
      * @param twoSidedLhPositions
-     * @param positiveAccounts
-     * @param reverseAccounts
      * @param plan
      * @return
      */
-    private JSONObject twoSidedAmountJson(JSONObject oddsJson, Map<String, List<Integer>> twoSidedDxPositions, Map<String, List<Integer>> twoSidedDsPositions, Map<String, List<Integer>> twoSidedLhPositions, List<UserConfig> positiveAccounts, List<UserConfig> reverseAccounts, PlanDoubleVO plan, Integer rounds) {
+    private JSONObject twoSidedAmountJson(JSONObject oddsJson, String wtype, Map<String, List<Integer>> twoSidedDxPositions, Map<String, List<Integer>> twoSidedDsPositions, Map<String, List<Integer>> twoSidedLhPositions, List<UserConfig> allAccounts, PlanDoubleVO plan, Integer rounds) {
         JSONObject twoSidedAmountJson = null;
         if (CollUtil.isNotEmpty(twoSidedDxPositions) || CollUtil.isNotEmpty(twoSidedDsPositions) || CollUtil.isNotEmpty(twoSidedLhPositions)) {
-            // 获取双面-大小正反投的位置 key
+            // 获取双面-大小投注的位置 key
             Map<String, List<String>> twoSidedDxOdds = new HashMap<>();
-            // 获取双面-单双正反投的位置 key
+            // 获取双面-单双投注的位置 key
             Map<String, List<String>> twoSidedDsOdds = new HashMap<>();
-            // 获取双面-龙虎正反投的位置 key
+            // 获取双面-龙虎投注的位置 key
             Map<String, List<String>> twoSidedLhOdds = new HashMap<>();
 
+            // 新API：不再从oddsJson.keySet()匹配betKey，直接根据投注类型和游戏类型计算idIndex
+            // 合并所有双面投注信息（不再区分正投/反投）
+            Map<String, List<BettingPositionInfo>> twoSidedMap = new HashMap<>();
+            
+            // 处理大小投注
             if (null != twoSidedDxPositions) {
-                twoSidedDxPositions.forEach((key, value) -> {
-                    for (int pos : value) {
-                        String jsonkey = "DX" + pos;
-                        List<String> matchedKeys = oddsJson.keySet().stream()
-                                .filter(matchedKey -> matchedKey.startsWith(jsonkey + "_"))
-                                .toList();
-                        twoSidedDxOdds.put(key, matchedKeys);
+                twoSidedDxPositions.forEach((betType, positions) -> {
+                    for (int pos : positions) {
+                        BettingPositionInfo positionInfo = new BettingPositionInfo();
+                        positionInfo.setPositionId(pos);
+                        positionInfo.setBetType(betType); // "大" 或 "小"
+                        // 根据游戏类型计算idIndex和rate（待实现具体逻辑）
+                        positionInfo.setIdIndex(null); // 待计算
+                        positionInfo.setRate(null); // 待计算
+                        
+                        twoSidedMap.computeIfAbsent(betType, k -> new ArrayList<>()).add(positionInfo);
                     }
                 });
             }
+            
+            // 处理单双投注
             if (null != twoSidedDsPositions) {
-                twoSidedDsPositions.forEach((key, value) -> {
-                    for (int pos : value) {
-                        String jsonkey = "DS" + pos;
-                        List<String> matchedKeys = oddsJson.keySet().stream()
-                                .filter(matchedKey -> matchedKey.startsWith(jsonkey + "_"))
-                                .toList();
-                        twoSidedDsOdds.put(key, matchedKeys);
+                twoSidedDsPositions.forEach((betType, positions) -> {
+                    for (int pos : positions) {
+                        BettingPositionInfo positionInfo = new BettingPositionInfo();
+                        positionInfo.setPositionId(pos);
+                        positionInfo.setBetType(betType); // "单" 或 "双"
+                        // 根据游戏类型计算idIndex和rate（待实现具体逻辑）
+                        positionInfo.setIdIndex(null); // 待计算
+                        positionInfo.setRate(null); // 待计算
+                        
+                        twoSidedMap.computeIfAbsent(betType, k -> new ArrayList<>()).add(positionInfo);
                     }
                 });
             }
+            
+            // 处理龙虎投注
             if (null != twoSidedLhPositions) {
-                twoSidedLhPositions.forEach((key, value) -> {
-                    for (int pos : value) {
-                        String jsonkey = "LH" + pos;
-                        List<String> matchedKeys = oddsJson.keySet().stream()
-                                .filter(matchedKey -> matchedKey.startsWith(jsonkey + "_"))
-                                .toList();
-                        twoSidedLhOdds.put(key, matchedKeys);
+                twoSidedLhPositions.forEach((betType, positions) -> {
+                    for (int pos : positions) {
+                        BettingPositionInfo positionInfo = new BettingPositionInfo();
+                        positionInfo.setPositionId(pos);
+                        positionInfo.setBetType(betType); // "龙" 或 "虎"
+                        // 根据游戏类型计算idIndex和rate（待实现具体逻辑）
+                        positionInfo.setIdIndex(null); // 待计算
+                        positionInfo.setRate(null); // 待计算
+                        
+                        twoSidedMap.computeIfAbsent(betType, k -> new ArrayList<>()).add(positionInfo);
                     }
                 });
             }
-
-            // 分配大小单双龙虎对应正反投
-            Map<String, Map<String, List<String>>> twoSidedMap = assignPositions(positiveAccounts, reverseAccounts, twoSidedDxOdds, twoSidedDsOdds, twoSidedLhOdds);
-            // 获取双面金额分配
-            twoSidedAmountJson = twoSidedDistributeAmount(twoSidedMap, positiveAccounts, reverseAccounts, plan, rounds);
+            
+            // 获取双面金额分配（统一使用所有账号）
+            twoSidedAmountJson = twoSidedDistributeAmount(twoSidedMap, oddsJson, wtype, allAccounts, plan, rounds);
         }
         return twoSidedAmountJson;
     }
@@ -1932,30 +2137,353 @@ public class PlanDoubleService {
     }
 
     /**
+     * 创建BetNew列表（新API格式）
+     * @param username 用户名
+     * @param monitorId 监控ID
+     * @param plan 翻倍计划
+     * @param oddsJson 赔率JSON
+     * @param drawNumber 期数
+     * @param amountJson 金额JSON（不再区分positive/reverse）
+     * @param twoSidedAmountJson 双面金额JSON（不再区分positive/reverse）
+     * @param userConfig 用户配置
+     * @param amountKeys 金额键列表
+     * @return BetNew列表
+     */
+    /**
+     * 创建BetNew列表（新API：直接根据投注位置信息创建，不再使用betKey格式）
+     * @param username 用户名
+     * @param monitorId 监控ID
+     * @param plan 计划
+     * @param oddsJson 赔率JSON
+     * @param drawNumber 期数
+     * @param amountJson 金额JSON（新结构：{"位置ID": {"idIndex": {"account": amount}}}）
+     * @param twoSidedAmountJson 双面金额JSON（新结构：{"投注类型": {"idIndex": {"account": amount}}}）
+     * @param userConfig 用户配置
+     * @param wtype 游戏类型
+     * @return BetNew列表
+     */
+    private List<BetNew> createBetNewList(String username, String monitorId, PlanDoubleVO plan,
+                                           JSONObject oddsJson, String drawNumber,
+                                           JSONObject amountJson, JSONObject twoSidedAmountJson,
+                                           UserConfig userConfig, String wtype) {
+        List<BetNew> betNewList = new ArrayList<>();
+
+        log.info("翻倍计划-创建BetNew列表, 账号:{}, 期数:{}, 方案:{}, 游戏类型:{}, amountJson:{}, twoSidedAmountJson:{}",
+                userConfig.getAccount(), drawNumber, plan.getName(), wtype, amountJson, twoSidedAmountJson);
+
+        // 处理普通投注（amountJson）
+        // 新结构: {"位置ID": {"idIndex": {"account": amount}}}
+        if (amountJson != null && !amountJson.isEmpty()) {
+            amountJson.forEach((positionId, positionValueObj) -> {
+                JSONObject positionValue = JSONUtil.parseObj(positionValueObj);
+                positionValue.forEach((idIndex, amountValueObj) -> {
+                    JSONObject amountValue = JSONUtil.parseObj(amountValueObj);
+                    Long amount = amountValue.getLong(userConfig.getAccount());
+                    if (amount == null || amount <= 0) {
+                        return; // 跳过金额为0或null的投注
+                    }
+
+                    // 获取赔率（从oddsJson的rate数组获取）
+                    String rate = null;
+                    if (oddsJson.containsKey("rate")) {
+                        JSONArray rateArray = oddsJson.getJSONArray("rate");
+                        if (rateArray != null) {
+                            try {
+                                int index = Integer.parseInt(idIndex);
+                                if (index >= 0 && index < rateArray.size()) {
+                                    rate = rateArray.getStr(index);
+                                }
+                            } catch (NumberFormatException e) {
+                                log.warn("翻倍计划-idIndex不是数字:{}", idIndex);
+                            }
+                        }
+                    }
+
+                    // 创建BetNew对象
+                    BetNew betNew = new BetNew();
+                    betNew.setIdIndex(idIndex);
+                    betNew.setAmount(String.valueOf(amount));
+                    betNew.setRate(rate != null ? rate : "0"); // 如果获取不到赔率，使用默认值0
+                    
+                    betNewList.add(betNew);
+                });
+            });
+        }
+
+        // 处理双面投注（twoSidedAmountJson）
+        // 新结构: {"投注类型": {"idIndex": {"account": amount}}}
+        if (twoSidedAmountJson != null && !twoSidedAmountJson.isEmpty()) {
+            twoSidedAmountJson.forEach((betType, betTypeValueObj) -> {
+                JSONObject betTypeValue = JSONUtil.parseObj(betTypeValueObj);
+                betTypeValue.forEach((idIndex, amountValueObj) -> {
+                    JSONObject amountValue = JSONUtil.parseObj(amountValueObj);
+                    Long amount = amountValue.getLong(userConfig.getAccount());
+                    if (amount == null || amount <= 0) {
+                        return;
+                    }
+
+                    // 获取赔率（从oddsJson的rate数组获取）
+                    String rate = null;
+                    if (oddsJson.containsKey("rate")) {
+                        JSONArray rateArray = oddsJson.getJSONArray("rate");
+                        if (rateArray != null) {
+                            try {
+                                int index = Integer.parseInt(idIndex);
+                                if (index >= 0 && index < rateArray.size()) {
+                                    rate = rateArray.getStr(index);
+                                }
+                            } catch (NumberFormatException e) {
+                                log.warn("翻倍计划-idIndex不是数字:{}", idIndex);
+                            }
+                        }
+                    }
+
+                    // 创建BetNew对象
+                    BetNew betNew = new BetNew();
+                    betNew.setIdIndex(idIndex);
+                    betNew.setAmount(String.valueOf(amount));
+                    betNew.setRate(rate != null ? rate : "0"); // 如果获取不到赔率，使用默认值0
+                    
+                    betNewList.add(betNew);
+                });
+            });
+        }
+
+        log.info("翻倍计划-创建BetNew列表完成, 账号:{}, 期数:{}, 方案:{}, BetNew数量:{}",
+                userConfig.getAccount(), drawNumber, plan.getName(), betNewList.size());
+
+        return betNewList;
+    }
+
+    /**
+     * 根据游戏类型和投注位置信息计算idIndex和rate（新API使用）
+     * @param positionInfo 投注位置信息
+     * @param oddsJson 赔率JSON（包含rate数组）
+     * @param wtype 游戏类型（all/OPN/TPD/TPC/TPB/DW3/n5）
+     * @return BetNew对象，如果计算失败返回null
+     */
+    private BetNew calculateBetNewFromPosition(BettingPositionInfo positionInfo, JSONObject oddsJson, String wtype) {
+        if (positionInfo == null || oddsJson == null || StringUtils.isBlank(wtype)) {
+            return null;
+        }
+        
+        BetNew betNew = new BetNew();
+        
+        try {
+            if ("all".equals(wtype)) {
+                // 主势盘：idIndex = 和值 + 1
+                if (positionInfo.getIdIndex() != null) {
+                    betNew.setIdIndex(positionInfo.getIdIndex());
+                    betNew.setRate(positionInfo.getRate());
+                    betNew.setAmount(String.valueOf(positionInfo.getPositionId())); // 临时使用positionId作为amount，后续会更新
+                    return betNew;
+                }
+            } else if ("OPN".equals(wtype)) {
+                // 单球1-3：根据球号和投注类型计算idIndex
+                // TODO: 实现单球1-3的计算逻辑
+                log.warn("翻倍计划-单球1-3计算逻辑待实现, positionInfo:{}", positionInfo);
+                return null;
+            } else if ("TPD".equals(wtype) || "TPC".equals(wtype) || "TPB".equals(wtype)) {
+                // 二字定位：idIndex = 第一位 * 10 + 第二位 + 1
+                // TODO: 实现二字定位的计算逻辑
+                log.warn("翻倍计划-二字定位计算逻辑待实现, positionInfo:{}, wtype:{}", positionInfo, wtype);
+                return null;
+            } else if ("DW3".equals(wtype)) {
+                // 三字定位：idIndex = 三位数字符串
+                // TODO: 实现三字定位的计算逻辑
+                log.warn("翻倍计划-三字定位计算逻辑待实现, positionInfo:{}", positionInfo);
+                return null;
+            } else if ("n5".equals(wtype)) {
+                // 两面盘：根据投注类型映射idIndex
+                // TODO: 实现两面盘的计算逻辑
+                log.warn("翻倍计划-两面盘计算逻辑待实现, positionInfo:{}", positionInfo);
+                return null;
+            } else {
+                log.warn("翻倍计划-未知游戏类型:{}", wtype);
+                return null;
+            }
+        } catch (Exception e) {
+            log.error("翻倍计划-计算BetNew异常, positionInfo:{}, wtype:{}, 错误:{}", positionInfo, wtype, e.getMessage(), e);
+            return null;
+        }
+        
+        return null;
+    }
+
+    /**
+     * 将旧格式的投注键转换为BetNew（保留用于兼容，逐步废弃）
+     * @param betKey 投注键（如 "B1_01", "DX1_大", "DS1_单", "LH1_龙" 等）
+     * @param amount 投注金额
+     * @param oddsJson 赔率JSON
+     * @param wtype 游戏类型（all/OPN/TPD/TPC/TPB/DW3/n5）
+     * @return BetNew对象
+     * @deprecated 新API不再使用betKey格式，应使用calculateBetNewFromPosition
+     */
+    @Deprecated
+    private BetNew convertToBetNew(String betKey, Long amount, JSONObject oddsJson, String wtype) {
+        BetNew betNew = new BetNew();
+
+        try {
+            if ("all".equals(wtype)) {
+                // 主势盘：和值投注
+                // betKey格式可能是 "B1_01"，需要转换为和值
+                // 解析betKey，提取位置和号码
+                String[] parts = betKey.split("_");
+                if (parts.length != 2) {
+                    log.warn("翻倍计划-转换BetNew失败, betKey格式错误:{}", betKey);
+                    return null;
+                }
+
+                String positionStr = parts[0].replace("B", ""); // 位置（1-10）
+                String numberStr = parts[1]; // 号码（01-10）
+
+                int position = Integer.parseInt(positionStr);
+                int number = Integer.parseInt(numberStr);
+
+                // 主势盘：投注号码就是和值
+                // 例如：投注号码1，对应和值1；投注号码2，对应和值2
+                int sumValue = number;
+
+                // idIndex = 和值 + 1
+                String idIndex = String.valueOf(sumValue + 1);
+
+                // 获取赔率：rate[和值 + 1]
+                if (!oddsJson.containsKey("rate")) {
+                    log.warn("翻倍计划-赔率JSON中没有rate数组, betKey:{}", betKey);
+                    return null;
+                }
+                JSONArray rateArray = oddsJson.getJSONArray("rate");
+                if (rateArray == null || rateArray.size() < sumValue + 1) {
+                    log.warn("翻倍计划-赔率数组长度不足, betKey:{}, sumValue:{}", betKey, sumValue);
+                    return null;
+                }
+                String rate = rateArray.getStr(sumValue + 1);
+
+                betNew.setIdIndex(idIndex);
+                betNew.setAmount(String.valueOf(amount));
+                betNew.setRate(rate);
+
+            } else if ("OPN".equals(wtype)) {
+                // 单球1-3：需要根据球号、投注类型计算idIndex
+                // TODO: 实现单球1-3的转换逻辑
+                // betKey格式可能是 "B1_01"（第一球号码1）或 "DX1_大"（第一球大）
+                log.warn("翻倍计划-单球1-3转换逻辑待实现, betKey:{}", betKey);
+                return null;
+
+            } else if ("TPD".equals(wtype) || "TPC".equals(wtype) || "TPB".equals(wtype)) {
+                // 二字定位：idIndex = 第一位 * 10 + 第二位 + 1
+                // TODO: 实现二字定位的转换逻辑
+                log.warn("翻倍计划-二字定位转换逻辑待实现, betKey:{}, wtype:{}", betKey, wtype);
+                return null;
+
+            } else if ("DW3".equals(wtype)) {
+                // 三字定位：idIndex直接是三位数字符串
+                // TODO: 实现三字定位的转换逻辑
+                log.warn("翻倍计划-三字定位转换逻辑待实现, betKey:{}", betKey);
+                return null;
+
+            } else if ("n5".equals(wtype)) {
+                // 两面盘：需要根据投注类型计算idIndex
+                // TODO: 实现两面盘的转换逻辑
+                log.warn("翻倍计划-两面盘转换逻辑待实现, betKey:{}", betKey);
+                return null;
+
+            } else {
+                log.warn("翻倍计划-未知游戏类型:{}", wtype);
+                return null;
+            }
+
+        } catch (Exception e) {
+            log.error("翻倍计划-转换BetNew异常, betKey:{}, wtype:{}, 错误:{}", betKey, wtype, e.getMessage(), e);
+            return null;
+        }
+
+        return betNew;
+    }
+
+    /**
+     * 创建失败结果JSON
+     * @param lottery 游戏类型
+     * @param drawNumber 期数
+     * @param account 账号
+     * @param message 错误消息
+     * @return JSON字符串
+     */
+    private String createFailedResult(String lottery, String drawNumber, String account, String message) {
+        JSONObject failed = new JSONObject();
+        failed.putOpt("status", 1);
+        failed.putOpt("lottery", lottery);
+        failed.putOpt("drawNumber", drawNumber);
+        failed.putOpt("createTime", LocalDateTimeUtil.format(LocalDateTime.now(), DatePattern.NORM_DATETIME_PATTERN));
+        failed.putOpt("account", account);
+        failed.putOpt("isRepair", 0);
+        failed.putOpt("message", message);
+        return JSONUtil.toJsonStr(failed);
+    }
+
+    /**
      * 封装发起提交下注
-     * @param order
-     * @param userConfig
-     * @param plan
-     * @param drawNumber
+     * @param betNewList BetNew列表
+     * @param userConfig 用户配置
+     * @param plan 翻倍计划
+     * @param drawNumber 期数
      * @return
      */
-    private String submitOrder(String username, OrderVO order, UserConfig userConfig, PlanDoubleVO plan, String drawNumber, String monitorId, long closeTime) {
-        log.info("翻倍计划-发起下单, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 账号token:{}, 订单:{}", username, userConfig.getAccount(), drawNumber, plan.getName(), userConfig.getToken(), JSONUtil.parseObj(order));
+    private String submitOrder(String username, List<BetNew> betNewList, UserConfig userConfig, PlanDoubleVO plan, String drawNumber, String monitorId, long closeTime) {
+        log.info("翻倍计划-发起下单, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 账号token:{}, BetNew数量:{}",
+                username, userConfig.getAccount(), drawNumber, plan.getName(), userConfig.getToken(),
+                betNewList != null ? betNewList.size() : 0);
+
+        if (betNewList == null || betNewList.isEmpty()) {
+            log.info("翻倍计划-下单失败, BetNew列表为空, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}",
+                    username, userConfig.getAccount(), drawNumber, plan.getName());
+            return createFailedResult(plan.getLottery(), drawNumber, userConfig.getAccount(),
+                    "投注列表为空");
+        }
+
         TimeInterval timeBet = DateUtil.timer();
-        boolean success = true;
-        String url = userConfig.getBaseUrl() + "member/bet";
+        String url = userConfig.getBaseUrl() + "app/control/bet.php";
+        String wtype = plan.getLottery(); // 获取游戏类型
+
         Map<String, String> headers = new HashMap<>();
-        headers.put("accept", "*/*");
-        headers.put("cookie", "defaultLT=" + plan.getLottery() + "; token=" + userConfig.getToken());
+        headers.put("accept", "application/json, text/javascript, */*; q=0.01");
+        headers.put("accept-language", "zh-CN,zh;q=0.9");
+        headers.put("cache-control", "no-cache");
+        headers.put("content-type", "application/x-www-form-urlencoded; charset=UTF-8");
+        headers.put("origin", userConfig.getBaseUrl());
+        headers.put("pragma", "no-cache");
         headers.put("sec-ch-ua-mobile", "?0");
         headers.put("sec-ch-ua-platform", "\"Windows\"");
         headers.put("sec-fetch-dest", "empty");
         headers.put("sec-fetch-mode", "cors");
         headers.put("sec-fetch-site", "same-origin");
-        headers.put("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
+        headers.put("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36");
         headers.put("x-requested-with", "XMLHttpRequest");
 
-        // 记录订单请求
+        // 构建URL参数
+        String params;
+        try {
+            params = "uid=" + userConfig.getToken()
+                    + "&gid=" + drawNumber
+                    + "&gtype=9"
+                    + "&wtype=" + wtype
+                    + "&ltype=1"
+                    + "&ratechg=1"
+                    + "&orders=" + URLEncoder.encode(JSONUtil.toJsonStr(betNewList), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            log.error("翻倍计划-构建URL参数失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}", 
+                     username, userConfig.getAccount(), drawNumber, plan.getName(), e);
+            return createFailedResult(plan.getLottery(), drawNumber, userConfig.getAccount(),
+                    "构建URL参数失败: " + e.getMessage());
+        }
+
+        // 记录订单请求（保存为JSON格式便于查看）
+        JSONObject orderRecord = new JSONObject();
+        orderRecord.put("lottery", plan.getLottery());
+        orderRecord.put("drawNumber", drawNumber);
+        orderRecord.put("wtype", wtype);
+        orderRecord.put("betNewList", betNewList);
+
         redisson.getBucket(KeyUtil.genKey(
                 RedisConstants.USER_BET_DOUBLE_PERIOD_REQ_PREFIX,
                 plan.getLottery(),
@@ -1965,46 +2493,52 @@ public class PlanDoubleService {
                 String.valueOf(plan.getId()),
                 monitorId,
                 userConfig.getAccount()
-        )).set(JSONUtil.toJsonStr(order), Duration.ofHours(24));
+        )).set(JSONUtil.toJsonStr(orderRecord), Duration.ofHours(24));
+        
         String result = null;
+        boolean success = false;
         try {
             // ✅ 使用 OkHttpProxyDispatcher 调用，并封装异步 + 超时
             CompletableFuture<OkHttpProxyDispatcher.HttpResult> future = CompletableFuture.supplyAsync(() -> {
                 try {
-                    log.info("翻倍计划-进行下单-发起下单请求 平台用户:{},游戏:{},期数:{},封盘时间:{},方案:{}", username, plan.getLottery(), drawNumber, LocalDateTimeUtil.of(closeTime), plan.getName());
-                    return dispatcher.execute("POST", url, JSONUtil.toJsonStr(order), headers, userConfig, false);
+                    log.info("翻倍计划-进行下单-发起下单请求 平台用户:{},游戏:{},期数:{},封盘时间:{},方案:{},参数:{}",
+                            username, plan.getLottery(), drawNumber, LocalDateTimeUtil.of(closeTime), plan.getName(), params);
+                    return dispatcher.execute("POST", url, params, headers, userConfig, false);
                 } catch (IOException e) {
-                    // 抛出包装异常，供外层 get() 捕获
                     throw new CompletionException(e);
                 }
             });
-            OkHttpProxyDispatcher.HttpResult resultHttp = future.get(10, TimeUnit.SECONDS); // 10 秒超时
+            
+            OkHttpProxyDispatcher.HttpResult resultHttp = future.get(10, TimeUnit.SECONDS);
             result = StringUtils.isNotBlank(resultHttp.getBody()) ? resultHttp.getBody() : null;
-            log.info("翻倍计划-下单结果, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 返回信息{}", username, userConfig.getAccount(), drawNumber, plan.getName(), result);
+            log.info("翻倍计划-下单结果, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 返回信息:{}",
+                    username, userConfig.getAccount(), drawNumber, plan.getName(), result);
 
             if (StringUtils.isBlank(result)) {
-                log.info("翻倍计划-下单失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 返回信息{}", username, userConfig.getAccount(), drawNumber, plan.getName(), result);
-                JSONObject failed = new JSONObject();
-                failed.putOpt("status", 1);
-                failed.putOpt("lottery", plan.getLottery());
-                failed.putOpt("drawNumber", drawNumber);
-                failed.putOpt("createTime", LocalDateTimeUtil.format(LocalDateTime.now(), DatePattern.NORM_DATETIME_PATTERN));
-                failed.putOpt("account", userConfig.getAccount());
-                failed.putOpt("isRepair", 0);// 是否为补单 0:否 1:是
-                failed.putOpt("message", "账号异常,请检查登录状态以及账号是否正常");
-                return JSONUtil.toJsonStr(failed);
-            } else if (!JSONUtil.isTypeJSONObject(result)) {
-                log.info("翻倍计划-下单失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 返回信息{}", username, userConfig.getAccount(), drawNumber, plan.getName(), result);
-                JSONObject failed = new JSONObject();
-                failed.putOpt("status", 1);
-                failed.putOpt("lottery", plan.getLottery());
-                failed.putOpt("drawNumber", drawNumber);
-                failed.putOpt("createTime", LocalDateTimeUtil.format(LocalDateTime.now(), DatePattern.NORM_DATETIME_PATTERN));
-                failed.putOpt("account", userConfig.getAccount());
-                failed.putOpt("isRepair", 0);// 是否为补单 0:否 1:是
-                failed.putOpt("message", "代理异常");
-                return JSONUtil.toJsonStr(failed);
+                log.info("翻倍计划-下单失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 返回信息为空",
+                        username, userConfig.getAccount(), drawNumber, plan.getName());
+                return createFailedResult(plan.getLottery(), drawNumber, userConfig.getAccount(),
+                        "账号异常,请检查登录状态以及账号是否正常");
             }
+            
+            if (!JSONUtil.isTypeJSONObject(result)) {
+                log.info("翻倍计划-下单失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 返回信息格式错误:{}",
+                        username, userConfig.getAccount(), drawNumber, plan.getName(), result);
+                return createFailedResult(plan.getLottery(), drawNumber, userConfig.getAccount(), "代理异常");
+            }
+            
+            JSONObject resultJson = JSONUtil.parseObj(result);
+            int title = resultJson.getInt("title", -1);
+            if (title != 1) {
+                log.info("翻倍计划-下单失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, title:{}",
+                        username, userConfig.getAccount(), drawNumber, plan.getName(), title);
+                return createFailedResult(plan.getLottery(), drawNumber, userConfig.getAccount(),
+                        "投注失败, title=" + title);
+            }
+            
+            log.info("翻倍计划-下单成功, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 下单花费:{}毫秒",
+                    username, userConfig.getAccount(), drawNumber, plan.getName(), timeBet.interval());
+            success = true;
         } catch (Exception e) {
             // ---------------------- 进入注单校验逻辑 ----------------------
             log.info("翻倍计划-开始注单确认检查,平台用户:{},盘口账号:{},期数:{},方案:{},封盘时间:{},进入确认是否需要补单逻辑：下注请求超时，启动最大 15 秒注单匹配流程",
@@ -2016,22 +2550,23 @@ public class PlanDoubleService {
             int maxTotalMillis = (int) (betTime - 5 * 1000);       // 补单判断总时长限制在关闭投注的5秒前
             long maxDurationMs = betTime - 5 * 1000;        // 最大注单匹配时间
 
-            List<Bet> bets = order.getBets();
-            if (CollUtil.isNotEmpty(bets)) {
-                boolean[] found = new boolean[bets.size()];  // 标记各注单是否匹配成功
+            // 新API使用BetNew，注单校验逻辑需要根据新API的返回结果调整
+            // TODO: 实现新API的注单校验逻辑
+            if (CollUtil.isNotEmpty(betNewList)) {
+                boolean[] found = new boolean[betNewList.size()];  // 标记各注单是否匹配成功
                 int foundCnt = 0;                            // 已匹配成功注单计数
                 int maxRetries = 5;                          // 最大轮询次数
                 int retryInterval = 2_000;                   // 每轮查询间隔时间 2秒
                 int pageSize = 15;                           // 接口分页大小
 
                 // 多轮查询已下注注单，确认是否已成功
-                for (int attempt = 1; attempt <= maxRetries && foundCnt < bets.size(); attempt++) {
+                for (int attempt = 1; attempt <= maxRetries && foundCnt < betNewList.size(); attempt++) {
                     long elapsed = System.currentTimeMillis() - fixStart;
 
                     // 超过最大判断时间，提前终止补单判断
                     if (elapsed >= maxTotalMillis) {
                         log.warn("翻倍计划-开始注单确认检查,平台用户:{},盘口账号:{},期数:{},方案:{},补单确认阶段超过20秒，提前结束查询，已匹配 {}/{} 注单",
-                                username, userConfig.getAccount(), drawNumber, plan.getName(), foundCnt, bets.size());
+                                username, userConfig.getAccount(), drawNumber, plan.getName(), foundCnt, betNewList.size());
                         break;
                     }
 
@@ -2046,7 +2581,7 @@ public class PlanDoubleService {
 
                     try {
                         // 分页查询注单列表
-                        while (curPage <= totalPages && foundCnt < bets.size()) {
+                        while (curPage <= totalPages && foundCnt < betNewList.size()) {
                             if (System.currentTimeMillis() - fixStart >= maxTotalMillis) break;
 
                             long remainingTime = maxDurationMs - (System.currentTimeMillis() - fixStart);
@@ -2081,17 +2616,19 @@ public class PlanDoubleService {
                                     String play = jo.getStr("play", "");
                                     long amount = jo.getLong("amount", -1L);
 
-                                    for (int i = 0; i < bets.size(); i++) {
+                                    // TODO: 实现新API的注单匹配逻辑
+                                    // 新API的注单格式与旧API不同，需要根据实际返回结果调整匹配逻辑
+                                    for (int i = 0; i < betNewList.size(); i++) {
                                         if (!found[i]) {
-                                            Bet b = bets.get(i);
-                                            String betPlay = handicapApi.getPlayOrderBets(b);
-                                            if (draw.contains(drawNumber)
-                                                    && play.contains(betPlay)
-                                                    && amount == b.getAmount()) {
+                                            BetNew betNew = betNewList.get(i);
+                                            // 根据新API的注单格式进行匹配
+                                            // 需要查看新API返回的注单数据结构来确定匹配逻辑
+                                            // 暂时简化处理：如果期数匹配且金额匹配，认为匹配成功
+                                            if (draw.contains(drawNumber) && amount == Long.parseLong(betNew.getAmount())) {
                                                 found[i] = true;
                                                 ++foundCnt;
                                                 log.info("开始注单确认检查,平台用户:{},盘口账号:{},期数:{},方案:{},匹配注单成功({}/{}): {}",
-                                                        username, userConfig.getAccount(), drawNumber, plan.getName(), foundCnt, bets.size(), b);
+                                                        username, userConfig.getAccount(), drawNumber, plan.getName(), foundCnt, betNewList.size(), betNew);
                                                 break;
                                             }
                                         }
@@ -2106,9 +2643,9 @@ public class PlanDoubleService {
                     }
 
                     log.info("翻倍计划-开始注单确认检查,平台用户:{},盘口账号:{},期数:{},方案:{},注单确认进度: 第{}/{}次尝试，已匹配 {}/{} 注单",
-                            username, userConfig.getAccount(), drawNumber, plan.getName(), attempt, maxRetries, foundCnt, bets.size());
+                            username, userConfig.getAccount(), drawNumber, plan.getName(), attempt, maxRetries, foundCnt, betNewList.size());
 
-                    if (foundCnt >= bets.size()) {
+                    if (foundCnt >= betNewList.size()) {
                         break;
                     }
 
@@ -2129,7 +2666,7 @@ public class PlanDoubleService {
                     }
                 }
 
-                successBet = (foundCnt >= bets.size());
+                successBet = (foundCnt >= betNewList.size());
             } else {
                 log.warn("翻倍计划-开始注单确认检查,平台用户:{},盘口账号:{},期数:{},方案:{},订单注单列表为空，无法确认下注成功",
                         username, userConfig.getAccount(), drawNumber, plan.getName());
@@ -2172,20 +2709,34 @@ public class PlanDoubleService {
         return StringUtils.isEmpty(result) ? null : result;
     }
 
-    private String mergeSubmitOrder(String username, UserConfig userConfig, List<PlanDoubleVO> plans, OrderVO finalOrder, String lottery, String drawNumber, Map<String, Map<Integer, String>> useMonitorIds, long closeTime) {
-        log.info("翻倍计划-发起下单, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 账号token:{}", username, userConfig.getAccount(), drawNumber, "合并型方案", userConfig.getToken());
+    private String mergeSubmitOrder(String username, UserConfig userConfig, List<PlanDoubleVO> plans, List<BetNew> mergedBetNewList, String lottery, String drawNumber, Map<String, Map<Integer, String>> useMonitorIds, long closeTime) {
+        log.info("翻倍计划-发起合并下单, 平台用户:{}, 账号:{}, 期数:{}, 方案数:{}, BetNew数量:{}",
+                username, userConfig.getAccount(), drawNumber, plans.size(),
+                mergedBetNewList != null ? mergedBetNewList.size() : 0);
+
+        if (mergedBetNewList == null || mergedBetNewList.isEmpty()) {
+            log.info("翻倍计划-合并下单, 平台用户:{}, 账号:{}, 期数:{}, 方案数:{}, BetNew列表为空",
+                    username, userConfig.getAccount(), drawNumber, plans.size());
+            return createFailedResult(lottery, drawNumber, userConfig.getAccount(), "投注列表为空");
+        }
+
         TimeInterval timeBet = DateUtil.timer();
-        boolean success = true;
-        String url = userConfig.getBaseUrl() + "member/bet";
+        String url = userConfig.getBaseUrl() + "app/control/bet.php";
+        // 获取第一个计划的wtype（所有计划应该使用相同的游戏类型）
+        String wtype = plans.get(0).getLottery();
+
         Map<String, String> headers = new HashMap<>();
-        headers.put("accept", "*/*");
-        headers.put("cookie", "defaultLT=" + lottery + "; token=" + userConfig.getToken());
+        headers.put("accept", "application/json, text/javascript, */*; q=0.01");
+        headers.put("accept-language", "zh-CN,zh;q=0.9");
+        headers.put("cache-control", "no-cache");
+        headers.put("content-type", "application/x-www-form-urlencoded; charset=UTF-8");
+        headers.put("origin", userConfig.getBaseUrl());
+        headers.put("pragma", "no-cache");
         headers.put("sec-ch-ua-mobile", "?0");
         headers.put("sec-ch-ua-platform", "\"Windows\"");
         headers.put("sec-fetch-dest", "empty");
         headers.put("sec-fetch-mode", "cors");
         headers.put("sec-fetch-site", "same-origin");
-        headers.put("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
         headers.put("x-requested-with", "XMLHttpRequest");
 
         // ✅ 获取Redis指定账户期数的所有订单请求
@@ -2210,18 +2761,14 @@ public class PlanDoubleService {
             OrderVO orderTemp = JSONUtil.toBean(orderObj.toString(), OrderVO.class);
             bets.addAll(orderTemp.getBets());
         }*/
-        if (ObjectUtil.isNull(finalOrder) || finalOrder.getBets().isEmpty()) {
-            log.info("翻倍计划-合并下单, 平台用户:{}, 账号:{}, 期数:{}, 方案数:{}, 订单请求为空", username, userConfig.getAccount(), drawNumber, plans.size());
-            return null;
-        }
-        log.info("翻倍计划-合并下单, 平台用户:{}, 账号:{}, 期数:{}, 封盘时间:{}, 方案数:{}, 订单bet数:{}", username, userConfig.getAccount(), drawNumber, LocalDateTimeUtil.of(closeTime), plans.size(), finalOrder.getBets().size());
-        finalOrder.setDrawNumber(drawNumber);
-        finalOrder.setIgnore(false);
-        finalOrder.setLottery(lottery);
-        finalOrder.setFastBets(false);
-        log.info("翻倍计划-合并下单,平台用户:{},期数:{},finalOrder:{}", username, drawNumber, JSONUtil.parseObj(finalOrder));
 
         // 记录订单请求
+        JSONObject orderRecord = new JSONObject();
+        orderRecord.putOpt("lottery", lottery);
+        orderRecord.putOpt("drawNumber", drawNumber);
+        orderRecord.putOpt("wtype", wtype);
+        orderRecord.putOpt("betNewList", mergedBetNewList);
+        
         redisson.getBucket(KeyUtil.genKey(
                 RedisConstants.USER_BET_DOUBLE_PERIOD_REQ_PREFIX,
                 lottery,
@@ -2230,46 +2777,77 @@ public class PlanDoubleService {
                 username,
                 "merge",
                 userConfig.getAccount()
-        )).set(JSONUtil.toJsonStr(finalOrder), Duration.ofHours(24));
-        String result = null;
+        )).set(JSONUtil.toJsonStr(orderRecord), Duration.ofHours(24));
+        
+        // 构建URL参数
+        String params;
         try {
-            // ✅ 使用 OkHttpProxyDispatcher 调用，并封装异步 + 超时
+            params = "uid=" + userConfig.getToken()
+                    + "&gid=" + drawNumber
+                    + "&gtype=9"
+                    + "&wtype=" + wtype
+                    + "&ltype=1"
+                    + "&ratechg=1"
+                    + "&orders=" + URLEncoder.encode(JSONUtil.toJsonStr(mergedBetNewList), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            log.error("翻倍计划-构建URL参数失败, 平台用户:{}, 账号:{}, 期数:{}, 方案数:{}", 
+                     username, userConfig.getAccount(), drawNumber, plans.size(), e);
+            return createFailedResult(lottery, drawNumber, userConfig.getAccount(),
+                    "构建URL参数失败: " + e.getMessage());
+        }
+        
+        String result = null;
+        boolean success = false;
+        try {
             CompletableFuture<OkHttpProxyDispatcher.HttpResult> future = CompletableFuture.supplyAsync(() -> {
                 try {
-                    log.info("翻倍计划-进行下单-发起下单请求 平台用户:{},游戏:{},期数:{},封盘时间:{},方案:{}", username, lottery, drawNumber, LocalDateTimeUtil.of(closeTime), "合并型方案");
-                    return dispatcher.execute("POST", url, JSONUtil.toJsonStr(finalOrder), headers, userConfig, false);
+                    log.info("翻倍计划-进行合并下单-发起下单请求 平台用户:{},游戏:{},期数:{},封盘时间:{},方案:{},参数:{}",
+                            username, lottery, drawNumber, LocalDateTimeUtil.of(closeTime), "合并型方案", params);
+                    return dispatcher.execute("POST", url, params, headers, userConfig, false);
                 } catch (IOException e) {
-                    // 抛出包装异常，供外层 get() 捕获
                     throw new CompletionException(e);
                 }
             });
-            OkHttpProxyDispatcher.HttpResult resultHttp = future.get(10, TimeUnit.SECONDS); // 10 秒超时
+            
+            OkHttpProxyDispatcher.HttpResult resultHttp = future.get(10, TimeUnit.SECONDS);
             result = StringUtils.isNotBlank(resultHttp.getBody()) ? resultHttp.getBody() : null;
-            log.info("翻倍计划-下单结果, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 返回信息{}", username, userConfig.getAccount(), drawNumber, "合并型方案", result);
+            log.info("翻倍计划-合并下单结果, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 返回信息:{}",
+                    username, userConfig.getAccount(), drawNumber, "合并型方案", result);
 
             if (StringUtils.isBlank(result)) {
-                log.info("翻倍计划-下单失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 返回信息{}", username, userConfig.getAccount(), drawNumber, "合并型方案", result);
-                JSONObject failed = new JSONObject();
-                failed.putOpt("status", 1);
-                failed.putOpt("lottery", lottery);
-                failed.putOpt("drawNumber", drawNumber);
-                failed.putOpt("createTime", LocalDateTimeUtil.format(LocalDateTime.now(), DatePattern.NORM_DATETIME_PATTERN));
-                failed.putOpt("account", userConfig.getAccount());
-                failed.putOpt("isRepair", 0);// 是否为补单 0:否 1:是
-                failed.putOpt("message", "账号异常,请检查登录状态以及账号是否正常");
-                return JSONUtil.toJsonStr(failed);
-            } else if (!JSONUtil.isTypeJSONObject(result)) {
-                log.info("翻倍计划-下单失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 返回信息{}", username, userConfig.getAccount(), drawNumber, "合并型方案", result);
-                JSONObject failed = new JSONObject();
-                failed.putOpt("status", 1);
-                failed.putOpt("lottery", lottery);
-                failed.putOpt("drawNumber", drawNumber);
-                failed.putOpt("createTime", LocalDateTimeUtil.format(LocalDateTime.now(), DatePattern.NORM_DATETIME_PATTERN));
-                failed.putOpt("account", userConfig.getAccount());
-                failed.putOpt("isRepair", 0);// 是否为补单 0:否 1:是
-                failed.putOpt("message", "代理异常");
-                return JSONUtil.toJsonStr(failed);
+                log.info("翻倍计划-合并下单失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 返回信息为空",
+                        username, userConfig.getAccount(), drawNumber, "合并型方案");
+                return createFailedResult(lottery, drawNumber, userConfig.getAccount(),
+                        "账号异常,请检查登录状态以及账号是否正常");
             }
+            
+            if (!JSONUtil.isTypeJSONObject(result)) {
+                log.info("翻倍计划-合并下单失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 返回信息格式错误:{}",
+                        username, userConfig.getAccount(), drawNumber, "合并型方案", result);
+                return createFailedResult(lottery, drawNumber, userConfig.getAccount(), "代理异常");
+            }
+            
+            JSONObject resultJson = JSONUtil.parseObj(result);
+            int title = resultJson.getInt("title", -1);
+            if (title != 1) {
+                log.info("翻倍计划-合并下单失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, title:{}",
+                        username, userConfig.getAccount(), drawNumber, "合并型方案", title);
+                return createFailedResult(lottery, drawNumber, userConfig.getAccount(),
+                        "投注失败, title=" + title);
+            }
+            
+            log.info("翻倍计划-合并下单成功, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 下单花费:{}毫秒",
+                    username, userConfig.getAccount(), drawNumber, "合并型方案", timeBet.interval());
+            success = true;
+            JSONObject resultObj = new JSONObject();
+            resultObj.putOpt("status", 0);
+            resultObj.putOpt("lottery", lottery);
+            resultObj.putOpt("drawNumber", drawNumber);
+            resultObj.putOpt("createTime", LocalDateTimeUtil.format(LocalDateTime.now(), DatePattern.NORM_DATETIME_PATTERN));
+            resultObj.putOpt("account", userConfig.getAccount());
+            resultObj.putOpt("isRepair", 0);// 是否为补单 0:否 1:是
+            resultObj.putOpt("message", "盘口投注成功");
+            return JSONUtil.toJsonStr(resultObj);
         } catch (Exception e) {
             // ---------------------- 进入注单校验逻辑 ----------------------
             log.info("翻倍计划-开始注单确认检查,平台用户:{},盘口账号:{},期数:{},方案:{},封盘时间:{},进入确认是否需要补单逻辑：下注请求超时，启动最大 15 秒注单匹配流程",
@@ -2281,22 +2859,23 @@ public class PlanDoubleService {
             int maxTotalMillis = (int) (betTime - 5 * 1000);       // 补单判断总时长限制在关闭投注的5秒前
             long maxDurationMs = betTime - 5 * 1000;        // 最大注单匹配时间
 
-            List<Bet> betAll = finalOrder.getBets();
-            if (CollUtil.isNotEmpty(betAll)) {
-                boolean[] found = new boolean[betAll.size()];  // 标记各注单是否匹配成功
+            // 新API使用BetNew，注单校验逻辑需要根据新API的返回结果调整
+            // TODO: 实现新API的注单校验逻辑
+            if (CollUtil.isNotEmpty(mergedBetNewList)) {
+                boolean[] found = new boolean[mergedBetNewList.size()];  // 标记各注单是否匹配成功
                 int foundCnt = 0;                            // 已匹配成功注单计数
                 int maxRetries = 5;                          // 最大轮询次数
                 int retryInterval = 2_000;                   // 每轮查询间隔时间 2秒
                 int pageSize = 15;                           // 接口分页大小
 
                 // 多轮查询已下注注单，确认是否已成功
-                for (int attempt = 1; attempt <= maxRetries && foundCnt < betAll.size(); attempt++) {
+                for (int attempt = 1; attempt <= maxRetries && foundCnt < mergedBetNewList.size(); attempt++) {
                     long elapsed = System.currentTimeMillis() - fixStart;
 
                     // 超过最大判断时间，提前终止补单判断
                     if (elapsed >= maxTotalMillis) {
                         log.warn("翻倍计划-开始注单确认检查,平台用户:{},盘口账号:{},期数:{},方案:{},补单确认阶段超过20秒，提前结束查询，已匹配 {}/{} 注单",
-                                username, userConfig.getAccount(), drawNumber, "合并型方案", foundCnt, betAll.size());
+                                username, userConfig.getAccount(), drawNumber, "合并型方案", foundCnt, mergedBetNewList.size());
                         break;
                     }
 
@@ -2311,7 +2890,7 @@ public class PlanDoubleService {
 
                     try {
                         // 分页查询注单列表
-                        while (curPage <= totalPages && foundCnt < finalOrder.getBets().size()) {
+                        while (curPage <= totalPages && foundCnt < mergedBetNewList.size()) {
                             if (System.currentTimeMillis() - fixStart >= maxTotalMillis) break;
 
                             long remainingTime = maxDurationMs - (System.currentTimeMillis() - fixStart);
@@ -2346,17 +2925,16 @@ public class PlanDoubleService {
                                     String play = jo.getStr("play", "");
                                     long amount = jo.getLong("amount", -1L);
 
-                                    for (int i = 0; i < finalOrder.getBets().size(); i++) {
+                                    // TODO: 实现新API的注单匹配逻辑
+                                    for (int i = 0; i < mergedBetNewList.size(); i++) {
                                         if (!found[i]) {
-                                            Bet b = finalOrder.getBets().get(i);
-                                            String betPlay = handicapApi.getPlayOrderBets(b);
-                                            if (draw.contains(drawNumber)
-                                                    && play.contains(betPlay)
-                                                    && amount == b.getAmount()) {
+                                            BetNew betNew = mergedBetNewList.get(i);
+                                            // 根据新API的注单格式进行匹配
+                                            if (draw.contains(drawNumber) && amount == Long.parseLong(betNew.getAmount())) {
                                                 found[i] = true;
                                                 ++foundCnt;
                                                 log.info("开始注单确认检查,平台用户:{},盘口账号:{},期数:{},方案:{},匹配注单成功({}/{}): {}",
-                                                        username, userConfig.getAccount(), drawNumber, "合并型方案", foundCnt, finalOrder.getBets().size(), b);
+                                                        username, userConfig.getAccount(), drawNumber, "合并型方案", foundCnt, mergedBetNewList.size(), betNew);
                                                 break;
                                             }
                                         }
@@ -2371,9 +2949,9 @@ public class PlanDoubleService {
                     }
 
                     log.info("翻倍计划-开始注单确认检查,平台用户:{},盘口账号:{},期数:{},方案:{},注单确认进度: 第{}/{}次尝试，已匹配 {}/{} 注单",
-                            username, userConfig.getAccount(), drawNumber, "合并型方案", attempt, maxRetries, foundCnt, finalOrder.getBets().size());
+                            username, userConfig.getAccount(), drawNumber, "合并型方案", attempt, maxRetries, foundCnt, mergedBetNewList.size());
 
-                    if (foundCnt >= finalOrder.getBets().size()) {
+                    if (foundCnt >= mergedBetNewList.size()) {
                         break;
                     }
 
@@ -2394,7 +2972,7 @@ public class PlanDoubleService {
                     }
                 }
 
-                successBet = (foundCnt >= finalOrder.getBets().size());
+                successBet = (foundCnt >= mergedBetNewList.size());
             } else {
                 log.warn("翻倍计划-开始注单确认检查,平台用户:{},盘口账号:{},期数:{},方案:{},订单注单列表为空，无法确认下注成功",
                         username, userConfig.getAccount(), drawNumber, "合并型方案");
@@ -2434,7 +3012,6 @@ public class PlanDoubleService {
         } finally {
             log.info("翻倍计划-下单结束, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 返回信息{}, 网络请求成功:{}, 下单花费:{}毫秒", username, userConfig.getAccount(), drawNumber, "合并型方案", result, success, timeBet.intervalMs());
         }
-        return StringUtils.isEmpty(result) ? null : result;
     }
 
     /**
@@ -2469,10 +3046,6 @@ public class PlanDoubleService {
                 successCount.incrementAndGet();
                 successUserCount.incrementAndGet();
                 log.info("翻倍计划-下单成功, 平台用户:{}, 账号:{}, 期数:{}", username, userConfig.getAccount(), drawNumber);
-            } else if (status == 2) {
-                // 失败逻辑
-                isSuccess = false;
-                resultJson.putOpt("message", "投注超时");
             } else {
                 // 失败逻辑
                 isSuccess = false;
@@ -2667,7 +3240,6 @@ public class PlanDoubleService {
         int reverseAmount = 0;
         for (PlanDoubleVO plan : plans) {
             positiveAmount += formatIds(plan.getPositiveAmount()).get(0);
-            reverseAmount += formatIds(plan.getReverseAmount()).get(0);
         }
 
         // 计算正反投的比例，保留两个小数点
@@ -3271,79 +3843,162 @@ public class PlanDoubleService {
     }
 
     /**
-     * 金额分配逻辑，首先遍历oddsMap，获取oddsMap下每个位置key，比如下标1有positive值的B1_1、B1_2、B1_3和reverse值的B1_4、B1_5、B1_6，然后根据userConfigs里的betType对应的账户，然后根据plan的betNum和oddsMap下每个位置key的数量，计算每个账户应该分配的金额，最后将金额分配给每个账户
-     *
-      */
-    public static JSONObject distributeAmount(Map<Integer, Map<String, List<String>>> oddsMap, List<UserConfig> positiveAccounts, List<UserConfig> reverseAccounts, PlanDoubleVO plan, Integer rounds) {
+     * 金额分配逻辑（新版本：统一使用所有账号，不再区分正投/反投）
+     * 首先遍历oddsMap，获取oddsMap下每个位置key，然后根据所有账号和plan的金额配置，计算每个账户应该分配的金额
+     * 新API：直接根据BettingPositionInfo分配金额，不再使用betKey格式
+     */
+    public static JSONObject distributeAmount(Map<Integer, BettingPositionInfo> oddsMap, JSONObject oddsJson, String wtype, List<UserConfig> allAccounts, PlanDoubleVO plan, Integer rounds) {
         JSONObject resultJson = new JSONObject();
 
+        // 合并正投和反投金额，统一使用
         List<Integer> positiveAmounts = formatIds(plan.getPositiveAmount());
-        List<Integer> reverseAmounts = formatIds(plan.getReverseAmount());
-        log.info("翻倍计划-正反金额分配-positiveAmounts大小:{}, reverseAmounts大小:{}, 当前rounds:{}", positiveAmounts.size(), reverseAmounts.size(), rounds);
-        // 遍历 oddsMap 中的每个 odds 数据
-        oddsMap.forEach((oddsKey, v) -> {
-            // 分配 positive 账户的金额
-            JSONObject posJson = new JSONObject();
-            List<String> posOddsKey = v.get("positive");
-            posOddsKey.forEach(odds -> {
-                JSONObject amountJson = distributeAmountsForAccounts(positiveAccounts, positiveAmounts.get(rounds));
-                posJson.putOpt(odds, amountJson);
-            });
-
-            // 分配 reverse 账户的金额
-            JSONObject revJson = new JSONObject();
-            List<String> revOddsKey = v.get("reverse");
-            revOddsKey.forEach(odds -> {
-                JSONObject amountJson = distributeAmountsForAccounts(reverseAccounts, reverseAmounts.get(rounds));
-                revJson.putOpt(odds, amountJson);
-            });
-
-            // 创建一个对象包含 pos 和 rev 的分配结果
-            JSONObject posRevJson = new JSONObject();
-            posRevJson.putOpt("positive", posJson);
-            posRevJson.putOpt("reverse", revJson);
-
-            // 将 oddsKey 对应的结果放入最终的结果中
-            resultJson.putOpt(String.valueOf(oddsKey), posRevJson);
+        int totalAmount = positiveAmounts.get(rounds);
+        
+        log.info("翻倍计划-统一金额分配-总金额:{}, 当前rounds:{}, 账号数:{}, wtype:{}", totalAmount, rounds, allAccounts.size(), wtype);
+        
+        // 遍历 oddsMap 中的每个投注位置信息
+        oddsMap.forEach((positionId, positionInfo) -> {
+            // 如果idIndex或rate还未计算，则根据游戏类型计算
+            if (positionInfo.getIdIndex() == null || positionInfo.getRate() == null) {
+                // 根据游戏类型和投注位置计算idIndex和rate
+                calculateIdIndexAndRate(positionInfo, oddsJson, wtype);
+            }
+            
+            // 如果计算失败，跳过该位置
+            if (positionInfo.getIdIndex() == null || positionInfo.getRate() == null) {
+                log.warn("翻倍计划-计算idIndex或rate失败, positionId:{}, positionInfo:{}", positionId, positionInfo);
+                return;
+            }
+            
+            // 统一分配金额给所有账号
+            JSONObject accountAmountJson = distributeAmountsForAccounts(allAccounts, totalAmount);
+            
+            // 使用idIndex作为key，存储金额分配结果
+            // 结构: {"位置ID": {"idIndex": {"account": amount}}}
+            JSONObject idIndexJson = new JSONObject();
+            idIndexJson.putOpt(positionInfo.getIdIndex(), accountAmountJson);
+            
+            resultJson.putOpt(String.valueOf(positionId), idIndexJson);
         });
 
         return resultJson;
     }
+    
+    /**
+     * 根据游戏类型和投注位置信息计算idIndex和rate
+     */
+    private static void calculateIdIndexAndRate(BettingPositionInfo positionInfo, JSONObject oddsJson, String wtype) {
+        if (positionInfo == null || oddsJson == null || StringUtils.isBlank(wtype)) {
+            return;
+        }
+        
+        try {
+            if ("all".equals(wtype)) {
+                // 主势盘：idIndex = 和值 + 1
+                int sumValue = positionInfo.getPositionId();
+                positionInfo.setIdIndex(String.valueOf(sumValue + 1));
+                // 获取赔率：rate[和值 + 1]
+                if (oddsJson.containsKey("rate")) {
+                    JSONArray rateArray = oddsJson.getJSONArray("rate");
+                    if (rateArray != null && rateArray.size() > sumValue + 1) {
+                        positionInfo.setRate(rateArray.getStr(sumValue + 1));
+                    }
+                }
+            } else if ("OPN".equals(wtype)) {
+                // 单球1-3：根据球号和投注类型计算idIndex
+                // TODO: 实现单球1-3的计算逻辑
+                log.warn("翻倍计划-单球1-3计算逻辑待实现, positionInfo:{}", positionInfo);
+            } else if ("TPD".equals(wtype) || "TPC".equals(wtype) || "TPB".equals(wtype)) {
+                // 二字定位：idIndex = 第一位 * 10 + 第二位 + 1
+                // TODO: 实现二字定位的计算逻辑
+                log.warn("翻倍计划-二字定位计算逻辑待实现, positionInfo:{}, wtype:{}", positionInfo, wtype);
+            } else if ("DW3".equals(wtype)) {
+                // 三字定位：idIndex = 三位数字符串
+                // TODO: 实现三字定位的计算逻辑
+                log.warn("翻倍计划-三字定位计算逻辑待实现, positionInfo:{}", positionInfo);
+            } else if ("n5".equals(wtype)) {
+                // 两面盘：根据投注类型映射idIndex
+                // TODO: 实现两面盘的计算逻辑
+                log.warn("翻倍计划-两面盘计算逻辑待实现, positionInfo:{}", positionInfo);
+            } else {
+                log.warn("翻倍计划-未知游戏类型:{}", wtype);
+            }
+        } catch (Exception e) {
+            log.error("翻倍计划-计算idIndex和rate异常, positionInfo:{}, wtype:{}, 错误:{}", positionInfo, wtype, e.getMessage(), e);
+        }
+    }
 
     /**
-     * 双面金额分配
-     * @param oddsMap
-     * @param positiveAccounts
-     * @param reverseAccounts
-     * @param plan
-     * @return
+     * 双面金额分配（新版本：统一使用所有账号，不再区分正投/反投）
      */
-    public static JSONObject twoSidedDistributeAmount(Map<String, Map<String, List<String>>> oddsMap, List<UserConfig> positiveAccounts, List<UserConfig> reverseAccounts, PlanDoubleVO plan, Integer rounds) {
-        // 遍历 oddsMap 中的每个 odds 数据
-        // 分配 positive 账户的金额
-        JSONObject posJson = new JSONObject();
-        Map<String, List<String>> posOddsKey = oddsMap.get("positive");
+    /**
+     * 双面金额分配（新版本：统一使用所有账号，不再区分正投/反投）
+     * 新API：直接根据BettingPositionInfo分配金额，不再使用betKey格式
+     */
+    public static JSONObject twoSidedDistributeAmount(Map<String, List<BettingPositionInfo>> twoSidedMap, JSONObject oddsJson, String wtype, List<UserConfig> allAccounts, PlanDoubleVO plan, Integer rounds) {
+        // 合并正投和反投金额，统一使用
         List<Integer> positiveAmounts = formatIds(plan.getPositiveAmount());
-        List<Integer> reverseAmounts = formatIds(plan.getReverseAmount());
-        posOddsKey.forEach((odds, accounts) -> {
-            JSONObject amountJson = distributeAmountsForAccounts(positiveAccounts, positiveAmounts.get(rounds));
-            posJson.putOpt(odds, amountJson);
+        int totalAmount = positiveAmounts.get(rounds);
+        
+        // 统一分配金额给所有账号
+        JSONObject resultJson = new JSONObject();
+        twoSidedMap.forEach((betType, positionInfos) -> {
+            // 对每个投注类型的位置信息，计算idIndex和rate，然后分配金额
+            for (BettingPositionInfo positionInfo : positionInfos) {
+                // 如果idIndex或rate还未计算，则根据游戏类型计算
+                if (positionInfo.getIdIndex() == null || positionInfo.getRate() == null) {
+                    calculateTwoSidedIdIndexAndRate(positionInfo, oddsJson, wtype, betType);
+                }
+                
+                // 如果计算失败，跳过该位置
+                if (positionInfo.getIdIndex() == null || positionInfo.getRate() == null) {
+                    log.warn("翻倍计划-计算双面投注idIndex或rate失败, betType:{}, positionInfo:{}", betType, positionInfo);
+                    continue;
+                }
+                
+                // 统一分配金额给所有账号
+                JSONObject accountAmountJson = distributeAmountsForAccounts(allAccounts, totalAmount);
+                
+                // 使用idIndex作为key，存储金额分配结果
+                // 结构: {"投注类型": {"idIndex": {"account": amount}}}
+                JSONObject betTypeJson = resultJson.getJSONObject(betType);
+                if (betTypeJson == null) {
+                    betTypeJson = new JSONObject();
+                    resultJson.putOpt(betType, betTypeJson);
+                }
+                betTypeJson.putOpt(positionInfo.getIdIndex(), accountAmountJson);
+            }
         });
 
-        // 分配 reverse 账户的金额
-        JSONObject revJson = new JSONObject();
-        Map<String, List<String>> revOddsKey = oddsMap.get("reverse");
-        revOddsKey.forEach((odds, accounts) -> {
-            JSONObject amountJson = distributeAmountsForAccounts(reverseAccounts, reverseAmounts.get(rounds));
-            revJson.putOpt(odds, amountJson);
-        });
-
-        // 创建一个对象包含 pos 和 rev 的分配结果
-        JSONObject posRevJson = new JSONObject();
-        posRevJson.putOpt("positive", posJson);
-        posRevJson.putOpt("reverse", revJson);
-
-        return posRevJson;
+        return resultJson;
+    }
+    
+    /**
+     * 根据游戏类型和双面投注类型计算idIndex和rate
+     */
+    private static void calculateTwoSidedIdIndexAndRate(BettingPositionInfo positionInfo, JSONObject oddsJson, String wtype, String betType) {
+        if (positionInfo == null || oddsJson == null || StringUtils.isBlank(wtype) || StringUtils.isBlank(betType)) {
+            return;
+        }
+        
+        try {
+            if ("all".equals(wtype)) {
+                // 主势盘：双面投注暂不支持，需要根据实际需求实现
+                log.warn("翻倍计划-主势盘双面投注计算逻辑待实现, betType:{}", betType);
+            } else if ("OPN".equals(wtype)) {
+                // 单球1-3：根据球号和投注类型计算idIndex
+                // TODO: 实现单球1-3双面投注的计算逻辑
+                log.warn("翻倍计划-单球1-3双面投注计算逻辑待实现, betType:{}, positionInfo:{}", betType, positionInfo);
+            } else if ("n5".equals(wtype)) {
+                // 两面盘：根据投注类型映射idIndex
+                // TODO: 实现两面盘的计算逻辑
+                log.warn("翻倍计划-两面盘计算逻辑待实现, betType:{}, positionInfo:{}", betType, positionInfo);
+            } else {
+                log.warn("翻倍计划-未知游戏类型或双面投注不支持:{}", wtype);
+            }
+        } catch (Exception e) {
+            log.error("翻倍计划-计算双面投注idIndex和rate异常, positionInfo:{}, wtype:{}, betType:{}, 错误:{}", positionInfo, wtype, betType, e.getMessage(), e);
+        }
     }
 
     private static JSONObject distributeAmountsForAccounts(List<UserConfig> accounts, int totalAmount) {
@@ -3361,7 +4016,7 @@ public class PlanDoubleService {
         }
 
         // 初始分配：保证每个账号至少分配2个单位
-        int initialShare = 5;
+        int initialShare = 2;
         int remainingAmount = totalAmount - betNum * initialShare;
 
         if (remainingAmount < 0) {
@@ -3467,7 +4122,7 @@ public class PlanDoubleService {
             String account = accounts.get(i).getAccount();
             int amount = amountJson.getInt(account);
             if (amount < initialShare) {
-                log.error("翻倍计划-分配金额出现小于5的情况 accounts大小:{}, totalAmount:{}, 分配结果:{}", accounts.size(), totalAmount, amountJson);
+                log.error("翻倍计划-分配金额出现小于2的情况 accounts大小:{}, totalAmount:{}, 分配结果:{}", accounts.size(), totalAmount, amountJson);
             }
         }
         return amountJson;
