@@ -433,7 +433,8 @@ public class HandicapApi {
             OkHttpProxyDispatcher.HttpResult resultHttp = dispatcher.execute("POST", url, params, headers, userConfig, false);
 
             // ✅ 成功判断
-            if (StringUtils.contains(resultHttp.getBody(), "密码已更改")) {
+            JSONObject result = JSONUtil.parseObj(resultHttp.getBody());
+            if (result.getInt("title", -1) == 1) {
                 log.info("修改初始密码成功 - 账号:{} 旧密码:{} 新密码:{}",
                         userConfig.getAccount(), oldPassword, password);
                 return true;
@@ -3954,11 +3955,11 @@ public class HandicapApi {
         }
 
         // 初始分配：保证每个账号至少分配2个单位
-        int initialShare = 5;
+        int initialShare = 1;
         int remainingAmount = totalAmount - betNum * initialShare;
 
         if (remainingAmount < 0) {
-            log.info("金额不足以保证每个投注至少 5 元");
+            log.info("金额不足以保证每个投注至少 1 元");
             return amountJson;
         }
 

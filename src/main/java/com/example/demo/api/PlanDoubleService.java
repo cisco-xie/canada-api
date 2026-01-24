@@ -169,6 +169,9 @@ public class PlanDoubleService {
                 executor.getCompletedTaskCount());
     }
 
+    private static Map<Integer, List<JSONObject>> getUseMonitorInfos(Map<Integer, List<JSONObject>> useMonitorInfos) {
+        return useMonitorInfos;
+    }
     /**
      * 自动下注 - 翻倍计划
      * 使用@Async注解，将方法标记为异步执行,不会阻塞定时任务
@@ -860,7 +863,7 @@ public class PlanDoubleService {
                                 username,
                                 String.valueOf(plan.getId())
                         );
-                        RList<JSONObject> monitorInfos = businessUserRedissonClient.getList(monitorKey);
+                        List<JSONObject> monitorInfos = businessUserRedissonClient.getList(monitorKey);
                         // 本期轮数值，根据轮数获取需要投注的金额
                         Integer rounds = 0;
                         // 下注线程池
@@ -889,14 +892,13 @@ public class PlanDoubleService {
                                 monitorInfo.putOpt("drawNumber", drawNumber.get());   // 期数
                                 monitorInfo.putOpt("rounds", 0);                // 监控轮次从第一期开始
                                 monitorInfo.putOpt("createTime", LocalDateTimeUtil.formatNormal(LocalDateTime.now()));
-                                // 直接使用RList，不要创建新的ArrayList
-                                monitorInfos.clear();
+                                monitorInfos = new ArrayList<>();
                                 monitorInfos.add(monitorInfo);
                             }
                             // 配置监控轮次
                             roundsMap.put(plan.getId(), rounds);
                             // 记录当前计划对应的monitorInfos（转换为List用于useMonitorInfos）
-                            useMonitorInfos.put(plan.getId(), new ArrayList<>(monitorInfos));
+                            useMonitorInfos.put(plan.getId(), monitorInfos);
                             // 使用 CountDownLatch 等待所有延迟任务完成
                             JSONObject twoSidedAmountJson = twoSidedAmountJson(oddsJson, wtype, twoSidedDxPositions, twoSidedDsPositions, twoSidedLhPositions, allAccounts, plan, rounds);
                             JSONObject amountJson = distributeAmount(oddsMap, oddsJson, wtype, allAccounts, plan, rounds);
@@ -928,14 +930,13 @@ public class PlanDoubleService {
                                 monitorInfo.putOpt("drawNumber", drawNumber.get());   // 期数
                                 monitorInfo.putOpt("rounds", 0);                // 监控轮次从第一期开始
                                 monitorInfo.putOpt("createTime", LocalDateTimeUtil.formatNormal(LocalDateTime.now()));
-                                // 直接使用RList，不要创建新的ArrayList
-                                monitorInfos.clear();
+                                monitorInfos = new ArrayList<>();
                                 monitorInfos.add(monitorInfo);
                             }
                             // 配置监控轮次
                             roundsMap.put(plan.getId(), rounds);
                             // 记录当前计划对应的monitorInfos（转换为List用于useMonitorInfos）
-                            useMonitorInfos.put(plan.getId(), new ArrayList<>(monitorInfos));
+                            useMonitorInfos.put(plan.getId(), monitorInfos);
                             // 使用 CountDownLatch 等待所有延迟任务完成
                             // CountDownLatch latch = new CountDownLatch(allAccounts.size()); // 初始化为需要执行的任务数
                             JSONObject twoSidedAmountJson = twoSidedAmountJson(oddsJson, wtype, twoSidedDxPositions, twoSidedDsPositions, twoSidedLhPositions, allAccounts, plan, rounds);
@@ -957,14 +958,13 @@ public class PlanDoubleService {
                             // 配置监控轮次
                             roundsMap.put(plan.getId(), rounds);
                             // 记录当前计划对应的monitorInfos（转换为List用于useMonitorInfos）
-                            useMonitorInfos.put(plan.getId(), new ArrayList<>(monitorInfos));
+                            getUseMonitorInfos(useMonitorInfos).put(plan.getId(), monitorInfos);
                             JSONObject monitorInfo = new JSONObject();
                             monitorInfo.putOpt("id", IdUtil.getSnowflakeNextIdStr());     // 期数ID
                             monitorInfo.putOpt("planId", plan.getId());     // 计划ID
                             monitorInfo.putOpt("drawNumber", drawNumber.get());   // 期数
                             monitorInfo.putOpt("rounds", 0);                // 监控轮次从第一期开始
                             monitorInfo.putOpt("createTime", LocalDateTimeUtil.formatNormal(LocalDateTime.now()));
-                            // 直接使用RList添加，会自动同步到Redis
                             monitorInfos.add(monitorInfo);
                             // 获取当前最新的监控期数，用于使用第几轮的投注金额
                             for (Object info : monitorInfos) {
@@ -4016,11 +4016,11 @@ public class PlanDoubleService {
         }
 
         // 初始分配：保证每个账号至少分配2个单位
-        int initialShare = 2;
+        int initialShare = 1;
         int remainingAmount = totalAmount - betNum * initialShare;
 
         if (remainingAmount < 0) {
-            log.info("翻倍计划-金额不足以保证每个投注至少 2 元");
+            log.info("翻倍计划-金额不足以保证每个投注至少 1 元");
             return amountJson;
         }
 
