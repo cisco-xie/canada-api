@@ -261,6 +261,8 @@ public class ConfigService {
                 configPlan.setEnable(enable);
                 // 将更新后的列表保存回 Redis
                 businessUserRedissonClient.getBucket(key).set(JSONUtil.toJsonStr(configPlan));
+
+                clearMonitor(username, configPlan.getLottery(), String.valueOf(configPlan.getId()));
             }
         }
     }
@@ -310,6 +312,8 @@ public class ConfigService {
                 }
                 // 将更新后的列表保存回 Redis
                 businessUserRedissonClient.getBucket(key).set(JSONUtil.toJsonStr(configPlan));
+
+                clearMonitor(username, configPlan.getLottery(), String.valueOf(configPlan.getId()));
             }
         }
     }
