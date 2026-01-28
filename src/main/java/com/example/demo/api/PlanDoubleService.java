@@ -33,12 +33,15 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.net.*;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
@@ -619,6 +622,87 @@ public class PlanDoubleService {
                                             amountKeys.add(uniquePositionId);
                                         }
                                         positions.add(pos);
+                                    } else if ("TPD".equals(wtype)) {
+                                        // 检查是否为二字定位（通过检查positionNum是否为TPD/TPC/TPB，或者lottery是否为二字定位类型）
+                                        String locationTypeStr = pos.getPositionNum();
+                                        boolean isTwoPositionType = "TPD".equals(locationTypeStr) || "TPC".equals(locationTypeStr) || "TPB".equals(locationTypeStr);
+                                        boolean isTwoPositionLottery = "TPD".equals(wtype) || "TPC".equals(wtype) || "TPB".equals(wtype);
+
+                                        if (isTwoPositionType || isTwoPositionLottery) {
+                                            // 二字定位：positionNum 存储的是定位类型（TPD/TPC/TPB）
+                                            // locationNum 存储的是投注位置（0-99，多个值用逗号分隔）
+                                            String betPositionsStr = pos.getLocationNum();
+
+                                            if (StringUtils.isBlank(betPositionsStr)) {
+                                                log.warn("翻倍计划-二字定位-投注位置不能为空, positionNum:{}, locationNum:{}", locationTypeStr, betPositionsStr);
+                                                continue;
+                                            }
+
+                                            // 根据positionNum确定实际的定位类型（如果positionNum是TPD/TPC/TPB，则使用它；否则使用wtype）
+                                            String actualWtype = wtype;
+                                            if (isTwoPositionType) {
+                                                actualWtype = locationTypeStr;
+                                                log.info("翻倍计划-二字定位-从positionNum提取定位类型, positionNum:{}, actualWtype:{}", locationTypeStr, actualWtype);
+                                            } else {
+                                                log.warn("翻倍计划-二字定位-positionNum不是有效的定位类型, positionNum:{}, 使用lottery wtype:{}", locationTypeStr, wtype);
+                                            }
+
+                                            // 解析投注位置（0-99，多个值用逗号分隔）
+                                            List<Integer> betPositions = formatIds(betPositionsStr);
+                                            for (Integer betPosition : betPositions) {
+                                                // 验证投注位置范围（0-99）
+                                                if (betPosition < 0 || betPosition > 99) {
+                                                    log.warn("翻倍计划-二字定位-投注位置超出范围，应为0-99:{}", betPosition);
+                                                    continue;
+                                                }
+
+                                                // 将0-99转换为第一位和第二位数字
+                                                // 例如：88 -> 第一位=8, 第二位=8
+                                                // 例如：5 -> 第一位=0, 第二位=5
+                                                // 例如：99 -> 第一位=9, 第二位=9
+                                                int firstDigit = betPosition / 10;
+                                                int secondDigit = betPosition % 10;
+
+                                                // 创建投注位置信息
+                                                BettingPositionInfo positionInfo = new BettingPositionInfo();
+                                                positionInfo.setFirstDigit(firstDigit);
+                                                positionInfo.setSecondDigit(secondDigit);
+                                                positionInfo.setLocationNum(betPositionsStr);
+                                                positionInfo.setPositionNum(locationTypeStr);
+
+                                                // 计算idIndex：idIndex = 第一位 * 10 + 第二位 + 1
+                                                int idIndex = firstDigit * 10 + secondDigit + 1;
+                                                positionInfo.setIdIndex(String.valueOf(idIndex));
+
+                                                // 使用唯一的positionId作为key（定位类型编码 * 1000 + idIndex）
+                                                // TPD=1, TPC=2, TPB=3
+                                                int locationTypeCode = 0;
+                                                if ("TPD".equals(actualWtype)) {
+                                                    locationTypeCode = 1;
+                                                } else if ("TPC".equals(actualWtype)) {
+                                                    locationTypeCode = 2;
+                                                } else if ("TPB".equals(actualWtype)) {
+                                                    locationTypeCode = 3;
+                                                }
+                                                int uniquePositionId = locationTypeCode * 1000 + idIndex;
+                                                positionInfo.setPositionId(uniquePositionId);
+
+                                                // 获取赔率（需要根据actualWtype获取对应游戏类型的赔率）
+                                                // 注意：这里需要重新获取对应定位类型的赔率，因为不同定位类型的赔率可能不同
+                                                if (oddsJson.containsKey("rate")) {
+                                                    JSONArray rateArray = oddsJson.getJSONArray("rate");
+                                                    if (rateArray != null) {
+                                                        if (rateArray.size() > idIndex) {
+                                                            positionInfo.setRate(rateArray.getStr(idIndex));
+                                                        }
+                                                    }
+                                                }
+
+                                                oddsMap.put(uniquePositionId, positionInfo);
+                                                amountKeys.add(uniquePositionId);
+                                            }
+                                            positions.add(pos);
+                                        }
                                     } else {
                                         // 其他游戏类型的处理（保持原有逻辑）
                                         boolean hasChinese = Validator.hasChinese(pos.getPositionNum());
@@ -1159,10 +1243,36 @@ public class PlanDoubleService {
                     List<CompletableFuture<Void>> betFutures = new ArrayList<>();
                     for (UserConfig userConfig : tokenValidConfigs) {
                         betFutures.add(CompletableFuture.runAsync(() -> {
-                            if (null == finalOrder.get(userConfig.getAccount())) {
-                                log.info("翻倍计划-发起下单,当前合并投注没有该账号的投注请求,无需投注, 平台用户:{}, 账号:{}, 期数:{}, 合并方案:{}", username, userConfig.getAccount(), drawNumber, finalOrder);
+                            String account = userConfig.getAccount();
+                            
+                            // 对于二字定位，finalOrder的key可能是"account_wtype"格式，需要检查所有相关的key
+                            boolean isTwoPosition = "TPD".equals(lottery) || "TPC".equals(lottery) || "TPB".equals(lottery);
+                            List<String> orderKeys = new ArrayList<>();
+                            
+                            if (isTwoPosition) {
+                                // 二字定位：检查所有定位类型的key
+                                for (String locationType : new String[]{"TPD", "TPC", "TPB"}) {
+                                    String key = account + "_" + locationType;
+                                    if (finalOrder.containsKey(key) && finalOrder.get(key) != null && !finalOrder.get(key).isEmpty()) {
+                                        orderKeys.add(key);
+                                    }
+                                }
+                                // 也检查原始的account key（兼容性）
+                                if (finalOrder.containsKey(account) && finalOrder.get(account) != null && !finalOrder.get(account).isEmpty()) {
+                                    orderKeys.add(account);
+                                }
+                            } else {
+                                // 非二字定位：使用原有的account key
+                                if (finalOrder.containsKey(account) && finalOrder.get(account) != null && !finalOrder.get(account).isEmpty()) {
+                                    orderKeys.add(account);
+                                }
+                            }
+                            
+                            if (orderKeys.isEmpty()) {
+                                log.info("翻倍计划-发起下单,当前合并投注没有该账号的投注请求,无需投注, 平台用户:{}, 账号:{}, 期数:{}, 合并方案:{}", username, account, drawNumber, finalOrder);
                                 return;
                             }
+                            
                             String isBetRedisKey = KeyUtil.genKey(
                                     RedisConstants.USER_BET_DOUBLE_PERIOD_RES_PREFIX,
                                     lottery,
@@ -1170,21 +1280,85 @@ public class PlanDoubleService {
                                     drawNumber.get(),
                                     "success",
                                     username,
-                                    userConfig.getAccount(),
+                                    account,
                                     "merge"
                             );
                             // 判断是否已下注
                             JSONObject exists = JSONUtil.parseObj(redisson.getBucket(isBetRedisKey).get());
                             if (!exists.isEmpty() && exists.getInt("type") == 2) {
-                                log.info("翻倍计划-平台用户:{},游戏:{},期数:{},账号:{},方案:{},已下过注,不再重复下注", username, lottery, drawNumber.get(), userConfig.getAccount()
+                                log.info("翻倍计划-平台用户:{},游戏:{},期数:{},账号:{},方案:{},已下过注,不再重复下注", username, lottery, drawNumber.get(), account
                                         , "合并式方案");
                                 return;
                             }
-                            log.info("翻倍计划-发起下单, 平台用户:{}, 账号:{}, 期数:{}, 合并方案:{}, 账号token:{}", username, userConfig.getAccount(), drawNumber, finalOrder, userConfig.getToken());
-                            // 提交下注
-                            String result = mergeSubmitOrder(username, userConfig, enabledPlanDoubles, finalOrder.get(userConfig.getAccount()), lottery, drawNumber.get(), useMonitorIds, closeTime.get());
-                            // 结果解析
-                            handleOrderResult(username, result, userConfig, lottery, drawNumber.get(), enabledPlanDoubles, successAccounts, failedAccounts, successCount, failureCount, successUserCount, failureUserCount);
+                            
+                            log.info("翻倍计划-发起下单, 平台用户:{}, 账号:{}, 期数:{}, 合并方案:{}, 账号token:{}, 订单keys:{}", 
+                                    username, account, drawNumber, finalOrder, userConfig.getToken(), orderKeys);
+                            
+                            // 对于二字定位，需要按定位类型分组提交
+                            if (isTwoPosition) {
+                                // 按定位类型分组提交
+                                boolean allSuccess = true;
+                                for (String orderKey : orderKeys) {
+                                    List<BetNew> betNewList = finalOrder.get(orderKey);
+                                    if (betNewList == null || betNewList.isEmpty()) {
+                                        continue;
+                                    }
+                                    
+                                    // 从key中提取定位类型
+                                    String actualWtype = lottery; // 默认使用计划的lottery
+                                    if (orderKey.contains("_")) {
+                                        String[] parts = orderKey.split("_");
+                                        if (parts.length >= 2) {
+                                            String wtypePart = parts[parts.length - 1];
+                                            if ("TPD".equals(wtypePart) || "TPC".equals(wtypePart) || "TPB".equals(wtypePart)) {
+                                                actualWtype = wtypePart;
+                                            }
+                                        }
+                                    }
+                                    
+                                    log.info("翻倍计划-合并下单-二字定位, 平台用户:{}, 账号:{}, 期数:{}, 定位类型:{}, BetNew数量:{}",
+                                            username, account, drawNumber, actualWtype, betNewList.size());
+                                    
+                                    // 为每个定位类型单独调用submitOrderForWtype
+                                    String result = submitOrderForWtype(username, userConfig, enabledPlanDoubles.get(0), betNewList, drawNumber.get(), actualWtype, closeTime.get());
+                                    if (result != null) {
+                                        JSONObject resultJson = JSONUtil.parseObj(result);
+                                        if (resultJson.getInt("status", -1) != 0) {
+                                            allSuccess = false;
+                                        }
+                                    } else {
+                                        allSuccess = false;
+                                    }
+                                }
+                                
+                                // 统一处理结果
+                                if (allSuccess) {
+                                    JSONObject resultObj = new JSONObject();
+                                    resultObj.putOpt("status", 0);
+                                    resultObj.putOpt("lottery", lottery);
+                                    resultObj.putOpt("drawNumber", drawNumber.get());
+                                    resultObj.putOpt("createTime", LocalDateTimeUtil.format(LocalDateTime.now(), DatePattern.NORM_DATETIME_PATTERN));
+                                    resultObj.putOpt("account", account);
+                                    resultObj.putOpt("isRepair", 0);
+                                    resultObj.putOpt("message", "盘口投注成功");
+                                    handleOrderResult(username, JSONUtil.toJsonStr(resultObj), userConfig, lottery, drawNumber.get(), enabledPlanDoubles, successAccounts, failedAccounts, successCount, failureCount, successUserCount, failureUserCount);
+                                } else {
+                                    JSONObject resultObj = new JSONObject();
+                                    resultObj.putOpt("status", 1);
+                                    resultObj.putOpt("lottery", lottery);
+                                    resultObj.putOpt("drawNumber", drawNumber.get());
+                                    resultObj.putOpt("createTime", LocalDateTimeUtil.format(LocalDateTime.now(), DatePattern.NORM_DATETIME_PATTERN));
+                                    resultObj.putOpt("account", account);
+                                    resultObj.putOpt("isRepair", 0);
+                                    resultObj.putOpt("message", "部分定位类型投注失败");
+                                    handleOrderResult(username, JSONUtil.toJsonStr(resultObj), userConfig, lottery, drawNumber.get(), enabledPlanDoubles, successAccounts, failedAccounts, successCount, failureCount, successUserCount, failureUserCount);
+                                }
+                            } else {
+                                // 非二字定位：使用原有逻辑
+                                String result = mergeSubmitOrder(username, userConfig, enabledPlanDoubles, finalOrder.get(account), lottery, drawNumber.get(), useMonitorIds, closeTime.get());
+                                // 结果解析
+                                handleOrderResult(username, result, userConfig, lottery, drawNumber.get(), enabledPlanDoubles, successAccounts, failedAccounts, successCount, failureCount, successUserCount, failureUserCount);
+                            }
                         }, executorMergeBetService));
                     }
                     // 等待所有下注操作完成
@@ -1538,39 +1712,162 @@ public class PlanDoubleService {
                             return;
                         }
                         
-                        log.info("翻倍计划-平台用户:{},游戏:{},期数:{},账号:{},方案:{},BetNew数量:{},将投注请求插入到finalOrder中,插入前:{}", 
-                                username, plan.getLottery(), drawNumber, userConfig.getAccount(), plan.getName(), betNewList.size(), finalOrder);
+                        // 检查是否为二字定位（通过检查amountJson中的positionId是否包含定位类型编码）
+                        // 对于二字定位，positionId = locationTypeCode * 1000 + idIndex（TPD=1, TPC=2, TPB=3）
+                        boolean isTwoPosition = false;
+                        Map<String, List<BetNew>> betNewListGrouped = new HashMap<>();
                         
-                        // 安全获取或创建BetNew列表
-                        finalOrder.compute(account, (k, existingList) -> {
-                            if (existingList == null) {
-                                return new ArrayList<>(betNewList);
-                            } else {
-                                existingList.addAll(betNewList);
-                                return existingList;
+                        if (amountJson != null && !amountJson.isEmpty()) {
+                            for (String positionId : amountJson.keySet()) {
+                                try {
+                                    int posId = Integer.parseInt(positionId);
+                                    int locationTypeCode = posId / 1000;
+                                    if (locationTypeCode >= 1 && locationTypeCode <= 3) {
+                                        isTwoPosition = true;
+                                        break;
+                                    }
+                                } catch (NumberFormatException e) {
+                                    // 不是数字，跳过
+                                }
                             }
-                        });
+                        }
                         
-                        log.info("翻倍计划-平台用户:{},游戏:{},期数:{},账号:{},方案:{},BetNew数量:{},将投注请求插入到finalOrder中,插入后:{}", 
-                                username, plan.getLottery(), drawNumber, userConfig.getAccount(), plan.getName(), betNewList.size(), finalOrder);
+                        if (isTwoPosition) {
+                            // 二字定位：按定位类型分组
+                            if (amountJson != null && !amountJson.isEmpty()) {
+                                amountJson.forEach((positionId, positionValueObj) -> {
+                                    JSONObject positionValue = JSONUtil.parseObj(positionValueObj);
+                                    positionValue.forEach((idIndex, amountValueObj) -> {
+                                        JSONObject amountValue = JSONUtil.parseObj(amountValueObj);
+                                        Long amount = amountValue.getLong(userConfig.getAccount());
+                                        if (amount == null || amount <= 0) {
+                                            return;
+                                        }
+                                        
+                                        // 从positionId提取定位类型
+                                        String actualWtype = wtype;
+                                        try {
+                                            int posId = Integer.parseInt(positionId);
+                                            int locationTypeCode = posId / 1000;
+                                            if (locationTypeCode == 1) {
+                                                actualWtype = "TPD";
+                                            } else if (locationTypeCode == 2) {
+                                                actualWtype = "TPC";
+                                            } else if (locationTypeCode == 3) {
+                                                actualWtype = "TPB";
+                                            }
+                                        } catch (NumberFormatException e) {
+                                            // 如果解析失败，使用默认的wtype
+                                        }
+                                        
+                                        // 获取赔率
+                                        String rate = null;
+                                        if (oddsJsonNew.containsKey("rate")) {
+                                            JSONArray rateArray = oddsJsonNew.getJSONArray("rate");
+                                            if (rateArray != null) {
+                                                try {
+                                                    int index = Integer.parseInt(idIndex);
+                                                    if (index >= 0 && index < rateArray.size()) {
+                                                        rate = rateArray.getStr(index);
+                                                    }
+                                                } catch (NumberFormatException e) {
+                                                    log.warn("翻倍计划-idIndex不是数字:{}", idIndex);
+                                                }
+                                            }
+                                        }
+                                        
+                                        // 创建BetNew对象
+                                        BetNew betNew = new BetNew();
+                                        betNew.setIdIndex(idIndex);
+                                        betNew.setAmount(String.valueOf(amount));
+                                        betNew.setRate(rate != null ? rate : "0");
+                                        
+                                        // 按定位类型分组
+                                        betNewListGrouped.computeIfAbsent(actualWtype, k -> new ArrayList<>()).add(betNew);
+                                    });
+                                });
+                            }
+                            
+                            // 为每个定位类型单独处理
+                            for (Map.Entry<String, List<BetNew>> entry : betNewListGrouped.entrySet()) {
+                                String actualWtype = entry.getKey();
+                                List<BetNew> groupedBetNewList = entry.getValue();
+                                
+                                if (groupedBetNewList == null || groupedBetNewList.isEmpty()) {
+                                    continue;
+                                }
+                                
+                                log.info("翻倍计划-平台用户:{},游戏:{},期数:{},账号:{},方案:{},定位类型:{},BetNew数量:{},将投注请求插入到finalOrder中", 
+                                        username, plan.getLottery(), drawNumber, userConfig.getAccount(), plan.getName(), actualWtype, groupedBetNewList.size());
+                                
+                                // 为每个定位类型创建唯一的key（account + wtype）
+                                String finalOrderKey = account + "_" + actualWtype;
+                                
+                                // 安全获取或创建BetNew列表
+                                finalOrder.compute(finalOrderKey, (k, existingList) -> {
+                                    if (existingList == null) {
+                                        return new ArrayList<>(groupedBetNewList);
+                                    } else {
+                                        existingList.addAll(groupedBetNewList);
+                                        return existingList;
+                                    }
+                                });
+                                
+                                // 记录订单请求（每个定位类型单独记录）
+                                JSONObject orderRecord = new JSONObject();
+                                orderRecord.put("lottery", plan.getLottery());
+                                orderRecord.put("drawNumber", drawNumber);
+                                orderRecord.put("wtype", actualWtype); // 使用实际的定位类型
+                                orderRecord.put("betNewList", groupedBetNewList);
+                                
+                                redisson.getBucket(KeyUtil.genKey(
+                                        RedisConstants.USER_BET_DOUBLE_PERIOD_REQ_PREFIX,
+                                        plan.getLottery(),
+                                        ToDayRangeUtil.getToDayRange(),
+                                        drawNumber,
+                                        username,
+                                        String.valueOf(plan.getId()),
+                                        monitorId,
+                                        userConfig.getAccount(),
+                                        actualWtype // 添加定位类型后缀
+                                )).set(JSONUtil.toJsonStr(orderRecord), Duration.ofHours(24));
+                            }
+                        } else {
+                            // 非二字定位：使用原有逻辑
+                            log.info("翻倍计划-平台用户:{},游戏:{},期数:{},账号:{},方案:{},BetNew数量:{},将投注请求插入到finalOrder中,插入前:{}", 
+                                    username, plan.getLottery(), drawNumber, userConfig.getAccount(), plan.getName(), betNewList.size(), finalOrder);
+                            
+                            // 安全获取或创建BetNew列表
+                            finalOrder.compute(account, (k, existingList) -> {
+                                if (existingList == null) {
+                                    return new ArrayList<>(betNewList);
+                                } else {
+                                    existingList.addAll(betNewList);
+                                    return existingList;
+                                }
+                            });
+                            
+                            log.info("翻倍计划-平台用户:{},游戏:{},期数:{},账号:{},方案:{},BetNew数量:{},将投注请求插入到finalOrder中,插入后:{}", 
+                                    username, plan.getLottery(), drawNumber, userConfig.getAccount(), plan.getName(), betNewList.size(), finalOrder);
 
-                        // 记录订单请求
-                        JSONObject orderRecord = new JSONObject();
-                        orderRecord.put("lottery", plan.getLottery());
-                        orderRecord.put("drawNumber", drawNumber);
-                        orderRecord.put("wtype", plan.getLottery());
-                        orderRecord.put("betNewList", betNewList);
-                        
-                        redisson.getBucket(KeyUtil.genKey(
-                                RedisConstants.USER_BET_DOUBLE_PERIOD_REQ_PREFIX,
-                                plan.getLottery(),
-                                ToDayRangeUtil.getToDayRange(),
-                                drawNumber,
-                                username,
-                                String.valueOf(plan.getId()),
-                                monitorId,
-                                userConfig.getAccount()
-                        )).set(JSONUtil.toJsonStr(orderRecord), Duration.ofHours(24));
+                            // 记录订单请求
+                            JSONObject orderRecord = new JSONObject();
+                            orderRecord.put("lottery", plan.getLottery());
+                            orderRecord.put("drawNumber", drawNumber);
+                            orderRecord.put("wtype", wtype);
+                            orderRecord.put("betNewList", betNewList);
+                            
+                            redisson.getBucket(KeyUtil.genKey(
+                                    RedisConstants.USER_BET_DOUBLE_PERIOD_REQ_PREFIX,
+                                    plan.getLottery(),
+                                    ToDayRangeUtil.getToDayRange(),
+                                    drawNumber,
+                                    username,
+                                    String.valueOf(plan.getId()),
+                                    monitorId,
+                                    userConfig.getAccount()
+                            )).set(JSONUtil.toJsonStr(orderRecord), Duration.ofHours(24));
+                        }
 
                         // 提交下注
                         // String result = submitOrder(username, order, userConfig, plan, drawNumber, monitorId, closeTime);
@@ -1752,7 +2049,31 @@ public class PlanDoubleService {
             
             // 解析开奖单号
             balls = ballsArray.toList(String.class);
-            String orderReqKey = KeyUtil.genKey(
+            
+            // 对于二字定位，需要检查所有可能的订单请求key（包括带定位类型后缀的）
+            boolean isTwoPosition = "TPD".equals(plan.getLottery()) || "TPC".equals(plan.getLottery()) || "TPB".equals(plan.getLottery());
+            List<String> orderReqKeys = new ArrayList<>();
+            
+            if (isTwoPosition) {
+                // 二字定位：检查所有定位类型的key
+                for (String locationType : new String[]{"TPD", "TPC", "TPB"}) {
+                    String key = KeyUtil.genKey(
+                            RedisConstants.USER_BET_DOUBLE_PERIOD_REQ_PREFIX,
+                            plan.getLottery(),
+                            ToDayRangeUtil.getToDayRange(),
+                            drawNumber,
+                            username,
+                            String.valueOf(plan.getId()),
+                            monitorId,
+                            userConfig.getAccount(),
+                            locationType
+                    );
+                    orderReqKeys.add(key);
+                }
+            }
+            
+            // 也检查原始的key（兼容性）
+            String baseOrderReqKey = KeyUtil.genKey(
                     RedisConstants.USER_BET_DOUBLE_PERIOD_REQ_PREFIX,
                     plan.getLottery(),
                     ToDayRangeUtil.getToDayRange(),
@@ -1762,31 +2083,50 @@ public class PlanDoubleService {
                     monitorId,
                     userConfig.getAccount()
             );
-            JSONObject orderReq = JSONUtil.parseObj(redisson.getBucket(orderReqKey).get());
-            if (orderReq.isEmpty()) {
-                log.info("翻倍计划-校验中号结果-获取订单请求为空-平台用户:{},账号:{}, 期数:{}, 方案:{}", username, userConfig.getAccount(), drawNumber, plan.getName());
-                return;
+            orderReqKeys.add(baseOrderReqKey);
+            
+            // 遍历所有可能的订单请求key，收集所有投注的idIndex
+            List<String> betIdIndexes = new ArrayList<>();
+            Map<String, String> wtypeMap = new HashMap<>(); // 存储每个idIndex对应的wtype
+            
+            for (String orderReqKey : orderReqKeys) {
+                JSONObject orderReq = JSONUtil.parseObj(redisson.getBucket(orderReqKey).get());
+                if (orderReq.isEmpty()) {
+                    continue; // 跳过不存在的订单请求
+                }
+                
+                // 获取订单请求中的wtype（实际的定位类型）
+                String orderWtype = orderReq.getStr("wtype");
+                if (StringUtils.isBlank(orderWtype)) {
+                    orderWtype = plan.getLottery(); // 如果没有wtype字段，使用plan.getLottery()
+                }
+                
+                // 新API订单结构：betNewList包含BetNew对象数组
+                JSONArray betNewListArray = orderReq.getJSONArray("betNewList");
+                if (betNewListArray != null && !betNewListArray.isEmpty()) {
+                    // 遍历 betNewList 数组，提取投注的idIndex
+                    for (int i = 0; i < betNewListArray.size(); i++) {
+                        JSONObject betNew = betNewListArray.getJSONObject(i);
+                        String idIndex = betNew.getStr("idIndex");
+                        if (StringUtils.isNotBlank(idIndex)) {
+                            betIdIndexes.add(idIndex);
+                            // 存储idIndex对应的wtype（用于二字定位的中号检测）
+                            wtypeMap.put(idIndex, orderWtype);
+                        }
+                    }
+                }
             }
             
-            // 新API订单结构：betNewList包含BetNew对象数组
-            JSONArray betNewListArray = orderReq.getJSONArray("betNewList");
-            if (betNewListArray == null || betNewListArray.isEmpty()) {
-                log.info("翻倍计划-校验中号结果-订单请求中betNewList为空-平台用户:{},账号:{}, 期数:{}, 方案:{}", 
+            if (betIdIndexes.isEmpty()) {
+                log.info("翻倍计划-校验中号结果-所有订单请求中betNewList为空-平台用户:{},账号:{}, 期数:{}, 方案:{}", 
                         username, userConfig.getAccount(), drawNumber, plan.getName());
                 return;
             }
             
-            // 遍历 betNewList 数组，提取投注的idIndex（对应和值）
-            List<String> betIdIndexes = new ArrayList<>();
-            for (int i = 0; i < betNewListArray.size(); i++) {
-                JSONObject betNew = betNewListArray.getJSONObject(i);
-                String idIndex = betNew.getStr("idIndex");
-                if (StringUtils.isNotBlank(idIndex)) {
-                    betIdIndexes.add(idIndex);
-                }
-            }
-            // 存入 map（key为账号，value为投注的idIndex列表）
+            // 存入 map（key为账号，value为投注的idIndex列表和对应的wtype）
             gameContentsMap.put(userConfig.getAccount(), betIdIndexes);
+            // 将wtypeMap存储到gameContentsMap中（使用特殊key）
+            gameContentsMap.put(userConfig.getAccount() + "_wtypeMap", new ArrayList<>(wtypeMap.values()));
         }
         
         // 计算开奖和值（加拿大28：三个球的和值）
@@ -1840,6 +2180,9 @@ public class PlanDoubleService {
             // 根据游戏类型计算中奖的idIndex
             Set<String> winningIdIndexes = new HashSet<>();
             
+            // 对于二字定位，需要为每个定位类型单独检测中号
+            boolean isTwoPosition = "TPD".equals(wtype) || "TPC".equals(wtype) || "TPB".equals(wtype);
+            
             if ("all".equals(wtype)) {
                 // 主势盘：idIndex对应和值（idIndex=1对应和值0，idIndex=2对应和值1，以此类推）
                 // 开奖和值对应的idIndex = drawSumValue + 1
@@ -1867,6 +2210,83 @@ public class PlanDoubleService {
                                 username, drawNumber, plan.getName(), balls, e);
                         return;
                     }
+                }
+            } else if (isTwoPosition) {
+                // 二字定位：需要为每个定位类型单独检测中号
+                // 从gameContentsMap中获取所有可能的定位类型（通过检查订单请求中的wtype）
+                Set<String> locationTypes = new HashSet<>();
+                for (UserConfig userConfig : positiveAccounts) {
+                    // 检查所有可能的订单请求key
+                    for (String locationType : new String[]{"TPD", "TPC", "TPB"}) {
+                        String orderReqKey = KeyUtil.genKey(
+                                RedisConstants.USER_BET_DOUBLE_PERIOD_REQ_PREFIX,
+                                plan.getLottery(),
+                                ToDayRangeUtil.getToDayRange(),
+                                drawNumber,
+                                username,
+                                String.valueOf(plan.getId()),
+                                monitorId,
+                                userConfig.getAccount(),
+                                locationType
+                        );
+                        JSONObject orderReq = JSONUtil.parseObj(redisson.getBucket(orderReqKey).get());
+                        if (!orderReq.isEmpty()) {
+                            String orderWtype = orderReq.getStr("wtype");
+                            if (StringUtils.isNotBlank(orderWtype) && 
+                                ("TPD".equals(orderWtype) || "TPC".equals(orderWtype) || "TPB".equals(orderWtype))) {
+                                locationTypes.add(orderWtype);
+                            }
+                        }
+                    }
+                }
+                
+                // 如果没有找到任何定位类型，使用plan.getLottery()作为默认值
+                if (locationTypes.isEmpty()) {
+                    locationTypes.add(wtype);
+                }
+                
+                // 为每个定位类型计算中奖idIndex
+                if (CollUtil.isNotEmpty(balls) && balls.size() >= 3) {
+                    try {
+                        int ball1 = Integer.parseInt(balls.get(0).trim());
+                        int ball2 = Integer.parseInt(balls.get(1).trim());
+                        int ball3 = Integer.parseInt(balls.get(2).trim());
+                        
+                        for (String locationType : locationTypes) {
+                            int firstDigit, secondDigit;
+                            if ("TPD".equals(locationType)) {
+                                // 佰拾定位：第一位和第二位
+                                firstDigit = ball1;
+                                secondDigit = ball2;
+                            } else if ("TPC".equals(locationType)) {
+                                // 佰个定位：第一位和第三位
+                                firstDigit = ball1;
+                                secondDigit = ball3;
+                            } else if ("TPB".equals(locationType)) {
+                                // 拾个定位：第二位和第三位
+                                firstDigit = ball2;
+                                secondDigit = ball3;
+                            } else {
+                                continue; // 跳过未知的定位类型
+                            }
+                            
+                            // 计算中奖idIndex：idIndex = 第一位 * 10 + 第二位 + 1
+                            int winningIdIndex = firstDigit * 10 + secondDigit + 1;
+                            if (winningIdIndex >= 1 && winningIdIndex <= 100) {
+                                winningIdIndexes.add(String.valueOf(winningIdIndex));
+                                log.info("翻倍计划-二字定位中号检测-平台用户:{}, 期数:{}, 方案:{}, 定位类型:{}, 开奖号码:{}={},{},{}, 第一位:{}, 第二位:{}, 中奖idIndex:{}", 
+                                        username, drawNumber, plan.getName(), locationType, balls, ball1, ball2, ball3, firstDigit, secondDigit, winningIdIndex);
+                            } else {
+                                log.warn("翻倍计划-二字定位中号检测-计算出的idIndex超出范围:{}", winningIdIndex);
+                            }
+                        }
+                    } catch (NumberFormatException e) {
+                        log.error("翻倍计划-二字定位中号检测-解析开奖号码失败-平台用户:{}, 期数:{}, 方案:{}, 开奖号码:{}", 
+                                username, drawNumber, plan.getName(), balls, e);
+                        return;
+                    }
+                } else {
+                    log.warn("翻倍计划-二字定位中号检测-开奖号码数量不足:{}", balls);
                 }
             } else {
                 // 其他游戏类型：暂时使用主势盘的逻辑（后续实现）
@@ -2644,6 +3064,128 @@ public class PlanDoubleService {
      * @param drawNumber 期数
      * @return
      */
+    /**
+     * 为指定wtype提交投注（用于二字定位等需要指定定位类型的场景）
+     * @param username 用户名
+     * @param userConfig 用户配置
+     * @param plan 翻倍计划
+     * @param betNewList BetNew列表
+     * @param drawNumber 期数
+     * @param wtype 游戏类型（定位类型：TPD/TPC/TPB）
+     * @param closeTime 封盘时间
+     * @return 投注结果JSON字符串
+     */
+    private String submitOrderForWtype(String username, UserConfig userConfig, PlanDoubleVO plan,
+                                       List<BetNew> betNewList, String drawNumber, String wtype, long closeTime) {
+        log.info("翻倍计划-发起下单(指定wtype), 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 定位类型:{}, 账号token:{}, BetNew数量:{}",
+                username, userConfig.getAccount(), drawNumber, plan.getName(), wtype, userConfig.getToken(),
+                betNewList != null ? betNewList.size() : 0);
+
+        if (betNewList == null || betNewList.isEmpty()) {
+            log.info("翻倍计划-下单失败, BetNew列表为空, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 定位类型:{}",
+                    username, userConfig.getAccount(), drawNumber, plan.getName(), wtype);
+            return createFailedResult(plan.getLottery(), drawNumber, userConfig.getAccount(),
+                    "投注列表为空");
+        }
+
+        TimeInterval timeBet = DateUtil.timer();
+        String url = userConfig.getBaseUrl() + "app/control/bet.php";
+
+        Map<String, String> headers = new HashMap<>();
+        headers.put("accept", "application/json, text/javascript, */*; q=0.01");
+        headers.put("accept-language", "zh-CN,zh;q=0.9");
+        headers.put("cache-control", "no-cache");
+        headers.put("content-type", "application/x-www-form-urlencoded; charset=UTF-8");
+        headers.put("origin", userConfig.getBaseUrl());
+        headers.put("pragma", "no-cache");
+        headers.put("sec-ch-ua-mobile", "?0");
+        headers.put("sec-ch-ua-platform", "\"Windows\"");
+        headers.put("sec-fetch-dest", "empty");
+        headers.put("sec-fetch-mode", "cors");
+        headers.put("sec-fetch-site", "same-origin");
+        headers.put("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36");
+        headers.put("x-requested-with", "XMLHttpRequest");
+
+        // 构建URL参数
+        String params;
+        try {
+            params = "uid=" + userConfig.getToken()
+                    + "&gid=" + drawNumber
+                    + "&gtype=9"
+                    + "&wtype=" + wtype  // 使用实际的定位类型
+                    + "&ltype=1"
+                    + "&ratechg=1"
+                    + "&orders=" + URLEncoder.encode(JSONUtil.toJsonStr(betNewList), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            log.error("翻倍计划-构建URL参数失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 定位类型:{}",
+                     username, userConfig.getAccount(), drawNumber, plan.getName(), wtype, e);
+            return createFailedResult(plan.getLottery(), drawNumber, userConfig.getAccount(),
+                    "构建URL参数失败: " + e.getMessage());
+        }
+
+        String result = null;
+        boolean success = false;
+        try {
+            CompletableFuture<OkHttpProxyDispatcher.HttpResult> future = CompletableFuture.supplyAsync(() -> {
+                try {
+                    log.info("翻倍计划-进行下单-发起下单请求 平台用户:{},游戏:{},期数:{},封盘时间:{},方案:{},定位类型:{},参数:{}",
+                            username, plan.getLottery(), drawNumber, LocalDateTimeUtil.of(closeTime), plan.getName(), wtype, params);
+                    return dispatcher.execute("POST", url, params, headers, userConfig, false);
+                } catch (IOException e) {
+                    throw new CompletionException(e);
+                }
+            });
+
+            OkHttpProxyDispatcher.HttpResult resultHttp = future.get(10, TimeUnit.SECONDS);
+            result = StringUtils.isNotBlank(resultHttp.getBody()) ? resultHttp.getBody() : null;
+            log.info("翻倍计划-下单结果, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 定位类型:{}, 返回信息:{}",
+                    username, userConfig.getAccount(), drawNumber, plan.getName(), wtype, result);
+
+            if (StringUtils.isBlank(result)) {
+                log.info("翻倍计划-下单失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 定位类型:{}, 返回信息为空",
+                        username, userConfig.getAccount(), drawNumber, plan.getName(), wtype);
+                return createFailedResult(plan.getLottery(), drawNumber, userConfig.getAccount(),
+                        "账号异常,请检查登录状态以及账号是否正常");
+            }
+
+            if (!JSONUtil.isTypeJSONObject(result)) {
+                log.info("翻倍计划-下单失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 定位类型:{}, 返回信息格式错误:{}",
+                        username, userConfig.getAccount(), drawNumber, plan.getName(), wtype, result);
+                return createFailedResult(plan.getLottery(), drawNumber, userConfig.getAccount(), "代理异常");
+            }
+
+            JSONObject resultJson = JSONUtil.parseObj(result);
+            int title = resultJson.getInt("title", -1);
+            if (title != 1) {
+                log.info("翻倍计划-下单失败, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 定位类型:{}, title:{}",
+                        username, userConfig.getAccount(), drawNumber, plan.getName(), wtype, title);
+                return createFailedResult(plan.getLottery(), drawNumber, userConfig.getAccount(),
+                        "投注失败, title=" + title);
+            }
+
+            log.info("翻倍计划-下单成功, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 定位类型:{}, 下单花费:{}毫秒",
+                    username, userConfig.getAccount(), drawNumber, plan.getName(), wtype, timeBet.interval());
+            success = true;
+            JSONObject resultObj = new JSONObject();
+            resultObj.putOpt("status", 0);
+            resultObj.putOpt("lottery", plan.getLottery());
+            resultObj.putOpt("drawNumber", drawNumber);
+            resultObj.putOpt("createTime", LocalDateTimeUtil.format(LocalDateTime.now(), DatePattern.NORM_DATETIME_PATTERN));
+            resultObj.putOpt("account", userConfig.getAccount());
+            resultObj.putOpt("isRepair", 0);
+            resultObj.putOpt("message", "盘口投注成功");
+            return JSONUtil.toJsonStr(resultObj);
+        } catch (Exception e) {
+            log.error("翻倍计划-下单异常, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 定位类型:{}",
+                     username, userConfig.getAccount(), drawNumber, plan.getName(), wtype, e);
+            return createFailedResult(plan.getLottery(), drawNumber, userConfig.getAccount(),
+                    "投注异常: " + e.getMessage());
+        } finally {
+            log.info("翻倍计划-下单结束, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 定位类型:{}, 返回信息{}, 网络请求成功:{}, 下单花费:{}毫秒",
+                    username, userConfig.getAccount(), drawNumber, plan.getName(), wtype, result, success, timeBet.intervalMs());
+        }
+    }
+
     private String submitOrder(String username, List<BetNew> betNewList, UserConfig userConfig, PlanDoubleVO plan, String drawNumber, String monitorId, long closeTime) {
         log.info("翻倍计划-发起下单, 平台用户:{}, 账号:{}, 期数:{}, 方案:{}, 账号token:{}, BetNew数量:{}",
                 username, userConfig.getAccount(), drawNumber, plan.getName(), userConfig.getToken(),
@@ -4214,9 +4756,54 @@ public class PlanDoubleService {
                     log.warn("翻倍计划-单球1-3-投注类型和位置编号都为空, positionInfo:{}", positionInfo);
                 }
             } else if ("TPD".equals(wtype) || "TPC".equals(wtype) || "TPB".equals(wtype)) {
-                // 二字定位：idIndex = 第一位 * 10 + 第二位 + 1
-                // TODO: 实现二字定位的计算逻辑
-                log.warn("翻倍计划-二字定位计算逻辑待实现, positionInfo:{}, wtype:{}", positionInfo, wtype);
+                // 二字定位：idIndex = 第一位 * 10 + 第二位 + 1 (1-100)
+                // positionInfo中应该包含firstDigit和secondDigit，或者从locationNum解析
+                Integer firstDigit = positionInfo.getFirstDigit();
+                Integer secondDigit = positionInfo.getSecondDigit();
+                
+                // 如果firstDigit和secondDigit未设置，尝试从locationNum解析
+                if (firstDigit == null || secondDigit == null) {
+                    String locationNum = positionInfo.getLocationNum();
+                    if (StringUtils.isNotBlank(locationNum)) {
+                        // locationNum存储的是投注位置（0-99，多个值用逗号分隔）
+                        List<Integer> betPositions = formatIds(locationNum);
+                        if (betPositions != null && !betPositions.isEmpty()) {
+                            // 取第一个值进行解析（如果有多个值，应该在调用前拆分）
+                            int betPosition = betPositions.get(0);
+                            if (betPosition < 0 || betPosition > 99) {
+                                log.warn("翻倍计划-二字定位-投注位置超出范围，应为0-99:{}", betPosition);
+                                return;
+                            }
+                            // 将0-99转换为第一位和第二位数字
+                            firstDigit = betPosition / 10;
+                            secondDigit = betPosition % 10;
+                            positionInfo.setFirstDigit(firstDigit);
+                            positionInfo.setSecondDigit(secondDigit);
+                        }
+                    }
+                }
+                
+                if (firstDigit == null || secondDigit == null) {
+                    log.warn("翻倍计划-二字定位-无法解析第一位和第二位数字, positionInfo:{}", positionInfo);
+                    return;
+                }
+                
+                // 计算idIndex：idIndex = 第一位 * 10 + 第二位 + 1
+                int idIndex = firstDigit * 10 + secondDigit + 1;
+                if (idIndex < 1 || idIndex > 100) {
+                    log.warn("翻倍计划-二字定位-idIndex超出范围, idIndex:{}, firstDigit:{}, secondDigit:{}", idIndex, firstDigit, secondDigit);
+                    return;
+                }
+                
+                positionInfo.setIdIndex(String.valueOf(idIndex));
+                
+                // 获取赔率
+                if (oddsJson.containsKey("rate")) {
+                    JSONArray rateArray = oddsJson.getJSONArray("rate");
+                    if (rateArray != null && rateArray.size() > idIndex) {
+                        positionInfo.setRate(rateArray.getStr(idIndex));
+                    }
+                }
             } else if ("DW3".equals(wtype)) {
                 // 三字定位：idIndex = 三位数字符串
                 // TODO: 实现三字定位的计算逻辑
@@ -4325,6 +4912,9 @@ public class PlanDoubleService {
                         positionInfo.setRate(rateArray.getStr(baseIndex));
                     }
                 }
+            } else if ("TPD".equals(wtype) || "TPC".equals(wtype) || "TPB".equals(wtype)) {
+                // 二字定位：双面投注暂不支持，需要根据实际需求实现
+                log.warn("翻倍计划-二字定位双面投注计算逻辑待实现, betType:{}, positionInfo:{}, wtype:{}", betType, positionInfo, wtype);
             } else if ("n5".equals(wtype)) {
                 // 两面盘：根据投注类型映射idIndex
                 // TODO: 实现两面盘的计算逻辑
