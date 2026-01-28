@@ -763,6 +763,62 @@ public class PlanDoubleService {
                                             amountKeys.add(uniquePositionId);
                                         }
                                         positions.add(pos);
+                                    } else if ("n5".equals(wtype)) {
+                                        // 两面盘：positionNum 存储的是投注类型（多个值用逗号分隔，如"总和大,总和小,龙"）
+                                        String betTypeStr = pos.getPositionNum();
+                                        
+                                        if (StringUtils.isBlank(betTypeStr)) {
+                                            log.warn("翻倍计划-两面盘-投注类型不能为空, positionNum:{}", betTypeStr);
+                                            continue;
+                                        }
+                                        
+                                        // 解析多个投注类型（用逗号分隔）
+                                        List<String> betTypes = formatIdsStr(betTypeStr);
+                                        for (String betType : betTypes) {
+                                            betType = betType.trim();
+                                            if (StringUtils.isBlank(betType)) {
+                                                continue;
+                                            }
+                                            
+                                            // 映射投注类型到idIndex
+                                            // 总和大=1, 总和小=2, 总和单=3, 总和双=4
+                                            // 龙=5, 虎=6, 和=7
+                                            // 第一球-大=8, 第一球-小=9, 第一球-单=10, 第一球-双=11
+                                            // 第二球-大=12, 第二球-小=13, 第二球-单=14, 第二球-双=15
+                                            // 第三球-大=16, 第三球-小=17, 第三球-单=18, 第三球-双=19
+                                            int idIndex = mapN5BetTypeToIdIndex(betType);
+                                            if (idIndex <= 0) {
+                                                log.warn("翻倍计划-两面盘-投注类型无效:{}", betType);
+                                                continue;
+                                            }
+                                            
+                                            // 创建投注位置信息
+                                            BettingPositionInfo positionInfo = new BettingPositionInfo();
+                                            positionInfo.setLocationNum(pos.getLocationNum());
+                                            positionInfo.setPositionNum(betType);
+                                            positionInfo.setIdIndex(String.valueOf(idIndex));
+                                            
+                                            // 使用唯一的positionId作为key（使用idIndex本身，因为1-19已经唯一）
+                                            int uniquePositionId = idIndex;
+                                            positionInfo.setPositionId(uniquePositionId);
+                                            
+                                            // 获取赔率（使用idIndex作为rate数组的索引）
+                                            if (oddsJson.containsKey("rate")) {
+                                                JSONArray rateArray = oddsJson.getJSONArray("rate");
+                                                if (rateArray != null) {
+                                                    // idIndex范围是1-19，rate数组索引也是1-19
+                                                    if (rateArray.size() > idIndex) {
+                                                        positionInfo.setRate(rateArray.getStr(idIndex));
+                                                    } else {
+                                                        log.warn("翻倍计划-两面盘-赔率数组长度不足, idIndex:{}, rateArray.size():{}", idIndex, rateArray.size());
+                                                    }
+                                                }
+                                            }
+                                            
+                                            oddsMap.put(uniquePositionId, positionInfo);
+                                            amountKeys.add(uniquePositionId);
+                                        }
+                                        positions.add(pos);
                                     } else {
                                         // 其他游戏类型的处理（保持原有逻辑）
                                         boolean hasChinese = Validator.hasChinese(pos.getPositionNum());
@@ -2377,6 +2433,88 @@ public class PlanDoubleService {
                 } else {
                     log.warn("翻倍计划-三字定位中号检测-开奖号码数量不足:{}", balls);
                 }
+            } else if ("n5".equals(wtype)) {
+                // 两面盘：根据开奖号码计算中奖idIndex
+                if (CollUtil.isNotEmpty(balls) && balls.size() >= 3) {
+                    try {
+                        int ball1 = Integer.parseInt(balls.get(0).trim());
+                        int ball2 = Integer.parseInt(balls.get(1).trim());
+                        int ball3 = Integer.parseInt(balls.get(2).trim());
+                        
+                        // 计算总和
+                        int sum = ball1 + ball2 + ball3;
+                        
+                        // 1. 总和大小：总和值0~13为【总和小】，14~27为【总和大】
+                        if (sum >= 0 && sum <= 13) {
+                            winningIdIndexes.add("2"); // 总和小
+                        } else if (sum >= 14 && sum <= 27) {
+                            winningIdIndexes.add("1"); // 总和大
+                        }
+                        
+                        // 2. 总和单双：总和值是单数为【总和单】，总和值是双数为【总和双】
+                        if (sum % 2 == 0) {
+                            winningIdIndexes.add("4"); // 总和双
+                        } else {
+                            winningIdIndexes.add("3"); // 总和单
+                        }
+                        
+                        // 3. 龙虎和：第一位号码和第三位号码比较
+                        if (ball1 > ball3) {
+                            winningIdIndexes.add("5"); // 龙
+                        } else if (ball1 < ball3) {
+                            winningIdIndexes.add("6"); // 虎
+                        } else {
+                            winningIdIndexes.add("7"); // 和
+                        }
+                        
+                        // 4. 第一球：大小单双
+                        // 大：>=5, 小：<=4
+                        if (ball1 >= 5) {
+                            winningIdIndexes.add("8"); // 第一球-大
+                        } else {
+                            winningIdIndexes.add("9"); // 第一球-小
+                        }
+                        // 单双
+                        if (ball1 % 2 == 0) {
+                            winningIdIndexes.add("11"); // 第一球-双
+                        } else {
+                            winningIdIndexes.add("10"); // 第一球-单
+                        }
+                        
+                        // 5. 第二球：大小单双
+                        if (ball2 >= 5) {
+                            winningIdIndexes.add("12"); // 第二球-大
+                        } else {
+                            winningIdIndexes.add("13"); // 第二球-小
+                        }
+                        if (ball2 % 2 == 0) {
+                            winningIdIndexes.add("15"); // 第二球-双
+                        } else {
+                            winningIdIndexes.add("14"); // 第二球-单
+                        }
+                        
+                        // 6. 第三球：大小单双
+                        if (ball3 >= 5) {
+                            winningIdIndexes.add("16"); // 第三球-大
+                        } else {
+                            winningIdIndexes.add("17"); // 第三球-小
+                        }
+                        if (ball3 % 2 == 0) {
+                            winningIdIndexes.add("19"); // 第三球-双
+                        } else {
+                            winningIdIndexes.add("18"); // 第三球-单
+                        }
+                        
+                        log.info("翻倍计划-两面盘中号检测-平台用户:{}, 期数:{}, 方案:{}, 开奖号码:{}={},{},{}, 总和:{}, 中奖idIndex:{}", 
+                                username, drawNumber, plan.getName(), balls, ball1, ball2, ball3, sum, winningIdIndexes);
+                    } catch (NumberFormatException e) {
+                        log.error("翻倍计划-两面盘中号检测-解析开奖号码失败-平台用户:{}, 期数:{}, 方案:{}, 开奖号码:{}", 
+                                username, drawNumber, plan.getName(), balls, e);
+                        return;
+                    }
+                } else {
+                    log.warn("翻倍计划-两面盘中号检测-开奖号码数量不足:{}", balls);
+                }
             } else {
                 // 其他游戏类型：暂时使用主势盘的逻辑（后续实现）
                 winningIdIndexes.add(String.valueOf(drawSumValue + 1));
@@ -3033,9 +3171,33 @@ public class PlanDoubleService {
                 return null;
             } else if ("n5".equals(wtype)) {
                 // 两面盘：根据投注类型映射idIndex
-                // TODO: 实现两面盘的计算逻辑
-                log.warn("翻倍计划-两面盘计算逻辑待实现, positionInfo:{}", positionInfo);
-                return null;
+                String betType = positionInfo.getPositionNum();
+                if (StringUtils.isBlank(betType)) {
+                    log.warn("翻倍计划-两面盘-投注类型为空, positionInfo:{}", positionInfo);
+                    return null;
+                }
+                
+                int idIndex = mapN5BetTypeToIdIndex(betType);
+                if (idIndex <= 0) {
+                    log.warn("翻倍计划-两面盘-投注类型无效:{}", betType);
+                    return null;
+                }
+                
+                positionInfo.setIdIndex(String.valueOf(idIndex));
+                
+                // 获取赔率
+                if (oddsJson.containsKey("rate")) {
+                    JSONArray rateArray = oddsJson.getJSONArray("rate");
+                    if (rateArray != null && rateArray.size() > idIndex) {
+                        positionInfo.setRate(rateArray.getStr(idIndex));
+                    }
+                }
+                
+                // 使用已创建的BetNew对象
+                betNew.setIdIndex(positionInfo.getIdIndex());
+                betNew.setAmount("1"); // 默认金额，实际金额在分配时设置
+                betNew.setRate(positionInfo.getRate() != null ? positionInfo.getRate() : "0");
+                return betNew;
             } else {
                 log.warn("翻倍计划-未知游戏类型:{}", wtype);
                 return null;
@@ -4965,8 +5127,32 @@ public class PlanDoubleService {
                 }
             } else if ("n5".equals(wtype)) {
                 // 两面盘：根据投注类型映射idIndex
-                // TODO: 实现两面盘的计算逻辑
-                log.warn("翻倍计划-两面盘计算逻辑待实现, positionInfo:{}", positionInfo);
+                String betType = positionInfo.getPositionNum();
+                if (StringUtils.isBlank(betType)) {
+                    // 尝试从locationNum解析
+                    betType = positionInfo.getLocationNum();
+                }
+                
+                if (StringUtils.isBlank(betType)) {
+                    log.warn("翻倍计划-两面盘-投注类型为空, positionInfo:{}", positionInfo);
+                    return;
+                }
+                
+                int idIndex = mapN5BetTypeToIdIndex(betType);
+                if (idIndex <= 0) {
+                    log.warn("翻倍计划-两面盘-投注类型无效:{}", betType);
+                    return;
+                }
+                
+                positionInfo.setIdIndex(String.valueOf(idIndex));
+                
+                // 获取赔率
+                if (oddsJson.containsKey("rate")) {
+                    JSONArray rateArray = oddsJson.getJSONArray("rate");
+                    if (rateArray != null && rateArray.size() > idIndex) {
+                        positionInfo.setRate(rateArray.getStr(idIndex));
+                    }
+                }
             } else {
                 log.warn("翻倍计划-未知游戏类型:{}", wtype);
             }
@@ -5072,8 +5258,22 @@ public class PlanDoubleService {
                 log.warn("翻倍计划-二字定位双面投注计算逻辑待实现, betType:{}, positionInfo:{}, wtype:{}", betType, positionInfo, wtype);
             } else if ("n5".equals(wtype)) {
                 // 两面盘：根据投注类型映射idIndex
-                // TODO: 实现两面盘的计算逻辑
-                log.warn("翻倍计划-两面盘计算逻辑待实现, betType:{}, positionInfo:{}", betType, positionInfo);
+                // betType就是投注类型（总和大、总和小等）
+                int idIndex = mapN5BetTypeToIdIndex(betType);
+                if (idIndex <= 0) {
+                    log.warn("翻倍计划-两面盘双面投注-投注类型无效, betType:{}", betType);
+                    return;
+                }
+                
+                positionInfo.setIdIndex(String.valueOf(idIndex));
+                
+                // 获取赔率
+                if (oddsJson.containsKey("rate")) {
+                    JSONArray rateArray = oddsJson.getJSONArray("rate");
+                    if (rateArray != null && rateArray.size() > idIndex) {
+                        positionInfo.setRate(rateArray.getStr(idIndex));
+                    }
+                }
             } else {
                 log.warn("翻倍计划-未知游戏类型或双面投注不支持:{}", wtype);
             }
@@ -5207,6 +5407,71 @@ public class PlanDoubleService {
             }
         }
         return amountJson;
+    }
+
+    /**
+     * 映射两面盘（n5）投注类型到idIndex
+     * @param betType 投注类型字符串
+     * @return idIndex，如果无效返回0
+     */
+    private static int mapN5BetTypeToIdIndex(String betType) {
+        if (StringUtils.isBlank(betType)) {
+            return 0;
+        }
+        
+        // 去除空格
+        String normalizedType = betType.trim();
+        
+        // 总和相关
+        if ("总和大".equals(normalizedType)) {
+            return 1;
+        } else if ("总和小".equals(normalizedType)) {
+            return 2;
+        } else if ("总和单".equals(normalizedType)) {
+            return 3;
+        } else if ("总和双".equals(normalizedType)) {
+            return 4;
+        }
+        // 龙虎和
+        else if ("龙".equals(normalizedType)) {
+            return 5;
+        } else if ("虎".equals(normalizedType)) {
+            return 6;
+        } else if ("和".equals(normalizedType)) {
+            return 7;
+        }
+        // 第一球（支持"第一球-大"和"第一球大"两种格式）
+        else if ("第一球-大".equals(normalizedType) || "第一球大".equals(normalizedType)) {
+            return 8;
+        } else if ("第一球-小".equals(normalizedType) || "第一球小".equals(normalizedType)) {
+            return 9;
+        } else if ("第一球-单".equals(normalizedType) || "第一球单".equals(normalizedType)) {
+            return 10;
+        } else if ("第一球-双".equals(normalizedType) || "第一球双".equals(normalizedType)) {
+            return 11;
+        }
+        // 第二球（支持"第二球-大"和"第二球大"两种格式）
+        else if ("第二球-大".equals(normalizedType) || "第二球大".equals(normalizedType)) {
+            return 12;
+        } else if ("第二球-小".equals(normalizedType) || "第二球小".equals(normalizedType)) {
+            return 13;
+        } else if ("第二球-单".equals(normalizedType) || "第二球单".equals(normalizedType)) {
+            return 14;
+        } else if ("第二球-双".equals(normalizedType) || "第二球双".equals(normalizedType)) {
+            return 15;
+        }
+        // 第三球（支持"第三球-大"和"第三球大"两种格式）
+        else if ("第三球-大".equals(normalizedType) || "第三球大".equals(normalizedType)) {
+            return 16;
+        } else if ("第三球-小".equals(normalizedType) || "第三球小".equals(normalizedType)) {
+            return 17;
+        } else if ("第三球-单".equals(normalizedType) || "第三球单".equals(normalizedType)) {
+            return 18;
+        } else if ("第三球-双".equals(normalizedType) || "第三球双".equals(normalizedType)) {
+            return 19;
+        }
+        
+        return 0; // 无效的投注类型
     }
 
 }
