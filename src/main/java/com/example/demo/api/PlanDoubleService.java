@@ -622,7 +622,7 @@ public class PlanDoubleService {
                                             amountKeys.add(uniquePositionId);
                                         }
                                         positions.add(pos);
-                                    } else if ("TPD".equals(wtype)) {
+                                    } else if ("TPD".equals(wtype) || "TPC".equals(wtype) || "TPB".equals(wtype)) {
                                         // 检查是否为二字定位（通过检查positionNum是否为TPD/TPC/TPB，或者lottery是否为二字定位类型）
                                         String locationTypeStr = pos.getPositionNum();
                                         boolean isTwoPositionType = "TPD".equals(locationTypeStr) || "TPC".equals(locationTypeStr) || "TPB".equals(locationTypeStr);
@@ -703,6 +703,66 @@ public class PlanDoubleService {
                                             }
                                             positions.add(pos);
                                         }
+                                    } else if ("DW3".equals(wtype)) {
+                                        // 三字定位：locationNum 存储的是投注位置（0-999，多个值用逗号分隔）
+                                        String betPositionsStr = pos.getLocationNum();
+                                        
+                                        if (StringUtils.isBlank(betPositionsStr)) {
+                                            log.warn("翻倍计划-三字定位-投注位置不能为空, locationNum:{}", betPositionsStr);
+                                            continue;
+                                        }
+                                        
+                                        // 解析投注位置（0-999，多个值用逗号分隔）
+                                        List<Integer> betPositions = formatIds(betPositionsStr);
+                                        for (Integer betPosition : betPositions) {
+                                            // 验证投注位置范围（0-999）
+                                            if (betPosition < 0 || betPosition > 999) {
+                                                log.warn("翻倍计划-三字定位-投注位置超出范围，应为0-999:{}", betPosition);
+                                                continue;
+                                            }
+                                            
+                                            // 将0-999转换为第一、二、三位数字
+                                            // 例如：884 -> 第一位=8, 第二位=8, 第三位=4
+                                            // 例如：5 -> 第一位=0, 第二位=0, 第三位=5
+                                            // 例如：123 -> 第一位=1, 第二位=2, 第三位=3
+                                            int firstDigit = betPosition / 100;
+                                            int secondDigit = (betPosition / 10) % 10;
+                                            int thirdDigit = betPosition % 10;
+                                            
+                                            // 创建投注位置信息
+                                            BettingPositionInfo positionInfo = new BettingPositionInfo();
+                                            positionInfo.setFirstDigit(firstDigit);
+                                            positionInfo.setSecondDigit(secondDigit);
+                                            positionInfo.setThirdDigit(thirdDigit);
+                                            positionInfo.setLocationNum(betPositionsStr);
+                                            positionInfo.setPositionNum(pos.getPositionNum());
+                                            
+                                            // 计算idIndex：idIndex = betPosition + 1 (1-1000)
+                                            // 位置0对应idIndex=1，位置999对应idIndex=1000
+                                            int idIndex = betPosition + 1;
+                                            positionInfo.setIdIndex(String.valueOf(idIndex));
+                                            
+                                            // 使用唯一的positionId作为key（使用betPosition本身，因为0-999已经唯一）
+                                            int uniquePositionId = betPosition;
+                                            positionInfo.setPositionId(uniquePositionId);
+                                            
+                                            // 获取赔率（使用idIndex作为rate数组的索引）
+                                            if (oddsJson.containsKey("rate")) {
+                                                JSONArray rateArray = oddsJson.getJSONArray("rate");
+                                                if (rateArray != null) {
+                                                    // idIndex范围是1-1000，rate数组索引也是1-1000
+                                                    if (rateArray.size() > idIndex) {
+                                                        positionInfo.setRate(rateArray.getStr(idIndex));
+                                                    } else {
+                                                        log.warn("翻倍计划-三字定位-赔率数组长度不足, idIndex:{}, rateArray.size():{}", idIndex, rateArray.size());
+                                                    }
+                                                }
+                                            }
+                                            
+                                            oddsMap.put(uniquePositionId, positionInfo);
+                                            amountKeys.add(uniquePositionId);
+                                        }
+                                        positions.add(pos);
                                     } else {
                                         // 其他游戏类型的处理（保持原有逻辑）
                                         boolean hasChinese = Validator.hasChinese(pos.getPositionNum());
@@ -2288,6 +2348,35 @@ public class PlanDoubleService {
                 } else {
                     log.warn("翻倍计划-二字定位中号检测-开奖号码数量不足:{}", balls);
                 }
+            } else if ("DW3".equals(wtype)) {
+                // 三字定位：根据开奖号码计算中奖idIndex
+                // 根据游戏结果加法中的第一、二、三位结合，如8+8+4=20就是884位置中
+                if (CollUtil.isNotEmpty(balls) && balls.size() >= 3) {
+                    try {
+                        int ball1 = Integer.parseInt(balls.get(0).trim());
+                        int ball2 = Integer.parseInt(balls.get(1).trim());
+                        int ball3 = Integer.parseInt(balls.get(2).trim());
+                        
+                        // 三字定位：根据开奖号码计算投注位置（0-999），然后计算idIndex = betPosition + 1 (1-1000)
+                        // 例如：8+8+4=20 -> 第一位=8, 第二位=8, 第三位=4 -> betPosition = 884 -> idIndex = 885
+                        int betPosition = ball1 * 100 + ball2 * 10 + ball3;
+                        if (betPosition < 0 || betPosition > 999) {
+                            log.warn("翻倍计划-三字定位中号检测-计算出的投注位置超出范围:{}", betPosition);
+                            return;
+                        }
+                        int winningIdIndex = betPosition + 1; // idIndex范围是1-1000
+                        winningIdIndexes.add(String.valueOf(winningIdIndex));
+                        
+                        log.info("翻倍计划-三字定位中号检测-平台用户:{}, 期数:{}, 方案:{}, 开奖号码:{}={},{},{}, 投注位置:{}, 中奖idIndex:{}", 
+                                username, drawNumber, plan.getName(), balls, ball1, ball2, ball3, betPosition, winningIdIndex);
+                    } catch (NumberFormatException e) {
+                        log.error("翻倍计划-三字定位中号检测-解析开奖号码失败-平台用户:{}, 期数:{}, 方案:{}, 开奖号码:{}", 
+                                username, drawNumber, plan.getName(), balls, e);
+                        return;
+                    }
+                } else {
+                    log.warn("翻倍计划-三字定位中号检测-开奖号码数量不足:{}", balls);
+                }
             } else {
                 // 其他游戏类型：暂时使用主势盘的逻辑（后续实现）
                 winningIdIndexes.add(String.valueOf(drawSumValue + 1));
@@ -2823,13 +2912,27 @@ public class PlanDoubleService {
                     if (oddsJson.containsKey("rate")) {
                         JSONArray rateArray = oddsJson.getJSONArray("rate");
                         if (rateArray != null) {
-                            try {
-                                int index = Integer.parseInt(idIndex);
-                                if (index >= 0 && index < rateArray.size()) {
-                                    rate = rateArray.getStr(index);
+                            // 对于所有游戏类型，idIndex都是数字字符串，直接解析即可
+                            if ("DW3".equals(wtype)) {
+                                try {
+                                    // 三字定位的idIndex范围是1-1000
+                                    int index = Integer.parseInt(idIndex);
+                                    if (index >= 1 && index <= 1000 && index < rateArray.size()) {
+                                        rate = rateArray.getStr(index);
+                                    }
+                                } catch (NumberFormatException e) {
+                                    log.warn("翻倍计划-三字定位-idIndex格式错误:{}", idIndex);
                                 }
-                            } catch (NumberFormatException e) {
-                                log.warn("翻倍计划-idIndex不是数字:{}", idIndex);
+                            } else {
+                                // 其他游戏类型：idIndex是数字字符串
+                                try {
+                                    int index = Integer.parseInt(idIndex);
+                                    if (index >= 0 && index < rateArray.size()) {
+                                        rate = rateArray.getStr(index);
+                                    }
+                                } catch (NumberFormatException e) {
+                                    log.warn("翻倍计划-idIndex不是数字:{}", idIndex);
+                                }
                             }
                         }
                     }
@@ -4805,9 +4908,61 @@ public class PlanDoubleService {
                     }
                 }
             } else if ("DW3".equals(wtype)) {
-                // 三字定位：idIndex = 三位数字符串
-                // TODO: 实现三字定位的计算逻辑
-                log.warn("翻倍计划-三字定位计算逻辑待实现, positionInfo:{}", positionInfo);
+                // 三字定位：idIndex = 三位数字符串（如 "884", "001", "999"）
+                // positionInfo中应该包含firstDigit、secondDigit和thirdDigit，或者从locationNum解析
+                Integer firstDigit = positionInfo.getFirstDigit();
+                Integer secondDigit = positionInfo.getSecondDigit();
+                Integer thirdDigit = positionInfo.getThirdDigit();
+                
+                // 如果firstDigit、secondDigit和thirdDigit未设置，尝试从locationNum解析
+                if (firstDigit == null || secondDigit == null || thirdDigit == null) {
+                    String locationNum = positionInfo.getLocationNum();
+                    if (StringUtils.isNotBlank(locationNum)) {
+                        // locationNum存储的是投注位置（0-999，多个值用逗号分隔）
+                        List<Integer> betPositions = formatIds(locationNum);
+                        if (betPositions != null && !betPositions.isEmpty()) {
+                            // 取第一个值进行解析（如果有多个值，应该在调用前拆分）
+                            int betPosition = betPositions.get(0);
+                            if (betPosition < 0 || betPosition > 999) {
+                                log.warn("翻倍计划-三字定位-投注位置超出范围，应为0-999:{}", betPosition);
+                                return;
+                            }
+                            // 将0-999转换为第一、二、三位数字
+                            firstDigit = betPosition / 100;
+                            secondDigit = (betPosition / 10) % 10;
+                            thirdDigit = betPosition % 10;
+                            positionInfo.setFirstDigit(firstDigit);
+                            positionInfo.setSecondDigit(secondDigit);
+                            positionInfo.setThirdDigit(thirdDigit);
+                        }
+                    }
+                }
+                
+                if (firstDigit == null || secondDigit == null || thirdDigit == null) {
+                    log.warn("翻倍计划-三字定位-无法解析第一、二、三位数字, positionInfo:{}", positionInfo);
+                    return;
+                }
+                
+                // 计算投注位置（0-999），然后计算idIndex = betPosition + 1 (1-1000)
+                int betPosition = firstDigit * 100 + secondDigit * 10 + thirdDigit;
+                if (betPosition < 0 || betPosition > 999) {
+                    log.warn("翻倍计划-三字定位-投注位置超出范围, betPosition:{}, firstDigit:{}, secondDigit:{}, thirdDigit:{}", 
+                            betPosition, firstDigit, secondDigit, thirdDigit);
+                    return;
+                }
+                
+                // idIndex = betPosition + 1 (1-1000)
+                // 位置0对应idIndex=1，位置999对应idIndex=1000
+                int idIndex = betPosition + 1;
+                positionInfo.setIdIndex(String.valueOf(idIndex));
+                
+                // 获取赔率（使用idIndex作为rate数组的索引）
+                if (oddsJson.containsKey("rate")) {
+                    JSONArray rateArray = oddsJson.getJSONArray("rate");
+                    if (rateArray != null && rateArray.size() > idIndex) {
+                        positionInfo.setRate(rateArray.getStr(idIndex));
+                    }
+                }
             } else if ("n5".equals(wtype)) {
                 // 两面盘：根据投注类型映射idIndex
                 // TODO: 实现两面盘的计算逻辑
