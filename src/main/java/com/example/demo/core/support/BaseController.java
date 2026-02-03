@@ -66,7 +66,7 @@ public class BaseController {
             token = token.replace(JWT_TOKEN_PREFIX, "");
             final JWT jwt = JWTUtil.parseToken(token);
             AdminLoginDTO adminLoginDTO = JSONUtil.toBean(jwt.getPayload().getClaimsJson(), AdminLoginDTO.class);
-            if (adminLoginDTO.getPlatform() != 1) {
+            if (adminLoginDTO.getPlatform() != 4) {
                 throw new BusinessException(SystemError.USER_1001);
             }
             return adminLoginDTO;

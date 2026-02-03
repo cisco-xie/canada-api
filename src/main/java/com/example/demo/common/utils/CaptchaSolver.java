@@ -7,8 +7,13 @@ import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.JarURLConnection;
+import java.net.URL;
 import java.util.*;
 import java.util.List;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 
 @Slf4j
 public class CaptchaSolver {
@@ -20,14 +25,44 @@ public class CaptchaSolver {
     private static final Map<Integer, List<BufferedImage>> templates = new HashMap<>();
 
     static {
+        ClassLoader cl = CaptchaSolver.class.getClassLoader();
         try {
             for (int i = 0; i <= 9; i++) {
                 List<BufferedImage> list = new ArrayList<>();
-                File dir = new File(CaptchaSolver.class.getClassLoader()
-                        .getResource("captcha_templates/" + i).toURI());
-                for (File f : Objects.requireNonNull(dir.listFiles((d, name) -> name.endsWith(".png")))) {
-                    BufferedImage img = ImageIO.read(f);
-                    list.add(img);
+                String basePath = "captcha_templates/" + i + "/";
+                URL dirUrl = cl.getResource(basePath);
+                if (dirUrl == null) {
+                    log.warn("验证码模板目录不存在: {}", basePath);
+                    templates.put(i, list);
+                    continue;
+                }
+                if ("jar".equals(dirUrl.getProtocol())) {
+                    // 从 JAR 内加载（打 jar 包后运行）
+                    JarURLConnection conn = (JarURLConnection) dirUrl.openConnection();
+                    try (JarFile jar = conn.getJarFile()) {
+                        String prefix = basePath;
+                        Enumeration<JarEntry> entries = jar.entries();
+                        while (entries.hasMoreElements()) {
+                            JarEntry entry = entries.nextElement();
+                            String name = entry.getName();
+                            if (name.startsWith(prefix) && name.endsWith(".png") && !entry.isDirectory()) {
+                                try (InputStream is = jar.getInputStream(entry)) {
+                                    BufferedImage img = ImageIO.read(is);
+                                    if (img != null) list.add(img);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // 从文件系统加载（IDE / 本地运行）
+                    File dir = new File(dirUrl.toURI());
+                    File[] files = dir.listFiles((d, name) -> name != null && name.endsWith(".png"));
+                    if (files != null) {
+                        for (File f : files) {
+                            BufferedImage img = ImageIO.read(f);
+                            if (img != null) list.add(img);
+                        }
+                    }
                 }
                 templates.put(i, list);
                 log.info("加载模板 {} -> {} 张", i, list.size());
@@ -110,7 +145,9 @@ public class CaptchaSolver {
         int bestDigit = 0;
         double bestScore = Double.MAX_VALUE;
         for (int i = 0; i <= 9; i++) {
-            for (BufferedImage tmpl : templates.get(i)) {
+            List<BufferedImage> list = templates.get(i);
+            if (list == null) continue;
+            for (BufferedImage tmpl : list) {
                 double score = compareImages(digitImg, tmpl);
                 if (score < bestScore) {
                     bestScore = score;

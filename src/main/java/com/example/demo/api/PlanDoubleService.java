@@ -2093,8 +2093,8 @@ public class PlanDoubleService {
                         // 检查返回的期数是否匹配
                         String currentGid = oddsJson.getStr("gid");
                         String currentBr = oddsJson.getStr("br"); // 上一期期数
-                        String currentBnum = oddsJson.getStr("bnum"); // 上一期开奖号码
-                        
+                        String currentBnum = oddsJson.getStr("bnum"); // 上一期开奖gid
+
                         // 如果当前期数匹配，说明已经开奖，可以从bnum获取开奖结果
                         // 如果br匹配，说明bnum就是我们要找的开奖结果
                         if (drawNumber.equals(currentGid) || drawNumber.equals(currentBr)) {

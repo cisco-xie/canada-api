@@ -22,5 +22,5 @@ public class AdminLoginDTO {
     private Integer autoBet = 0;
     private Integer skip = 1;       // 是否跳过 0不跳过 1跳过
     private String group;
-    private Integer platform = 4;   // 平台 1对冲 2跟投 3足球
+    private Integer platform = 4;   // 平台 1对冲 2跟投 3足球 4加拿大
 }
