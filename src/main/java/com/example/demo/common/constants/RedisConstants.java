@@ -87,4 +87,24 @@ public class RedisConstants {
      * 开奖结果信息 - 用于获取开奖结果信息前缀
      */
     public static final String DRAW_RESULT_PREFIX = "draw:result";
+    /**
+     * 开奖结果统计 - 用于获取开奖结果统计前缀
+     */
+    public static final String DRAW_RESULT_TOTAL_KEY_PREFIX = "draw:stat:total";
+    /**
+     * 开奖结果统计 - 用于获取开奖结果统计前缀
+     */
+    public static final String DRAW_RESULT_BALL1_KEY_PREFIX = "draw:stat:ball1";
+    /**
+     * 开奖结果统计 - 用于获取开奖结果统计前缀
+     */
+    public static final String DRAW_RESULT_BALL2_KEY_PREFIX = "draw:stat:ball2";
+    /**
+     * 开奖结果统计 - 用于获取开奖结果统计前缀
+     */
+    public static final String DRAW_RESULT_BALL3_KEY_PREFIX = "draw:stat:ball3";
+    /**
+     * 开奖结果统计 - 用于获取开奖结果统计前缀
+     */
+    public static final String DRAW_RESULT_SUM_KEY_PREFIX = "draw:stat:sum";
 }

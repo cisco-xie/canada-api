@@ -19,6 +19,7 @@ package com.example.demo.controller;
 import cn.hutool.core.collection.CollUtil;
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
+import com.example.demo.api.DrawStatService;
 import com.example.demo.common.enmu.SystemError;
 import com.example.demo.core.model.UserConfig;
 import com.example.demo.core.support.BaseController;
@@ -49,6 +50,9 @@ public class BasicController extends BaseController {
 
     @Resource
     private ConfigService configService;
+
+    @Resource
+    private DrawStatService drawStatService;
 
     @Operation(summary = "")
     @GetMapping("/add")
@@ -388,6 +392,12 @@ public class BasicController extends BaseController {
     public Result refreshRedis() {
         configService.refreshRedis();
         return Result.success();
+    }
+
+    @Operation(summary = "开奖统计")
+    @GetMapping("/draw/stat")
+    public Result drawStat() {
+        return Result.success(drawStatService.getStatistics("JND28"));
     }
 
 }

@@ -17,6 +17,7 @@
 package com.example.demo.controller;
 
 import com.example.demo.api.ConfigService;
+import com.example.demo.api.DrawHistoryBackfillService;
 import com.example.demo.api.HandicapApi;
 import com.example.demo.api.PlanDoubleService;
 import com.example.demo.core.result.Result;
@@ -27,6 +28,8 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
+
+import java.time.LocalDate;
 
 
 @Slf4j
@@ -43,6 +46,20 @@ public class TestController extends BaseController {
 
     @Resource
     private PlanDoubleService planDoubleService;
+
+    @Resource
+    private DrawHistoryBackfillService drawHistoryBackfillService;
+
+    @Operation(summary = "历史开奖补全：按日期范围从第三方拉取并写入 Redis，默认 2025-12-01 ～ 2026-02-02")
+    @GetMapping("/draw-history-backfill")
+    public Result<Integer> drawHistoryBackfill(
+            @RequestParam(value = "from", required = false) String from,
+            @RequestParam(value = "to", required = false) String to) {
+        LocalDate fromDate = from != null && !from.isEmpty() ? LocalDate.parse(from) : LocalDate.of(2025, 12, 1);
+        LocalDate toDate = to != null && !to.isEmpty() ? LocalDate.parse(to) : LocalDate.of(2026, 2, 9);
+        int totalSaved = drawHistoryBackfillService.backfill(fromDate, toDate);
+        return Result.success(totalSaved);
+    }
 
     @Operation(summary = "")
     @GetMapping("/bet")

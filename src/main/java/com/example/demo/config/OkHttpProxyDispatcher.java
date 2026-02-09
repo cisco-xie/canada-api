@@ -195,7 +195,7 @@ public class OkHttpProxyDispatcher {
                     //if (code >= 200 && code < 300) {
                         // 成功，重置失败计数
                         state.reset();
-                        log.info("[OkHttpProxyDispatcher] 请求成功，方法={}，URL={}，账户={}，代理={}[{}]，耗时={}m", method, url, config.getAccount(), key, config.getProxyType() == 1 ? "HTTP" : "SOCKS", cost);
+                        log.info("[OkHttpProxyDispatcher] 请求成功，方法={}，URL={}，账户={}，代理=[{}]，耗时={}m", method, url, config.getAccount(), key, proxyTypeStr, cost);
                         return new HttpResult(respBody, respHeaders, code, cookieToken, cost);
                     /*} else {
                         throw new IOException("响应失败，状态码：" + code + "，响应体：" + respBody);
@@ -203,8 +203,8 @@ public class OkHttpProxyDispatcher {
                 }
             } catch (Exception e) {
                 state.fail();
-                log.warn("[OkHttpProxyDispatcher] 请求失败，方法={}，URL={}，账户={}，代理={}[{}]，失败次数={}/{}, 错误：{}",
-                        method, url, config.getAccount(), key, config.getProxyType() == 1 ? "HTTP" : "SOCKS", state.getFailCount(), MAX_FAIL, e.getMessage());
+                log.warn("[OkHttpProxyDispatcher] 请求失败，方法={}，URL={}，账户={}，代理=[{}]，失败次数={}/{}, 错误：{}",
+                        method, url, config.getAccount(), key, (config.getProxyType() == null || config.getProxyType() == 0) ? "无代理" : (config.getProxyType() == 1 ? "HTTP" : "SOCKS"), state.getFailCount(), MAX_FAIL, e.getMessage());
                 if (attempt == MAX_RETRY) {
                     throw new IOException("请求全部重试失败：" + e.getMessage(), e);
                 }

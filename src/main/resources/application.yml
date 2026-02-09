@@ -9,9 +9,15 @@ spring:
       port: 6379
       timeout: 5s
       database: 6
-#      password: 20241201
-      password:
+      password: 20241201
+#      password:
 # 为不同业务设置不同的数据库
 redis:
   database:
     businessUser: 7
+
+# 第三方开奖历史 API（无需登录，用于实时保存开奖结果，与盘口解耦）
+draw:
+  history:
+    api:
+      base-url: https://ctlop8966.bw6571.com
